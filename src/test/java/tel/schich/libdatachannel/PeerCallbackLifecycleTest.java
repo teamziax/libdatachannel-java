@@ -3,116 +3,111 @@ package tel.schich.libdatachannel;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
-import java.lang.ref.WeakReference;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 import static tel.schich.libdatachannel.LibDataChannelNative.rtcDeletePeerConnection;
 
+/**
+ * Deleting a peer connection blocks until libdatachannel has drained the callbacks it already scheduled. The callback
+ * state behind the peer's user pointer therefore has to outlive that call, otherwise a draining callback reads memory
+ * that has already been freed.
+ *
+ * <p>A use after free takes the whole JVM down, so the scenario runs in a child process and this test only looks at how
+ * that process ended.
+ */
 class PeerCallbackLifecycleTest {
-    private static final long CALLBACK_TIMEOUT_MILLIS = TimeUnit.SECONDS.toMillis(5);
-
-    static {
-        LibDataChannel.initialize();
-    }
-
-    private static native void armSignalingStateCallback();
-
-    private static native boolean awaitSignalingStateCallback(long timeoutMillis);
-
-    private static native void releaseSignalingStateCallback(boolean dispatch);
-
     @Test
-    @Timeout(15)
-    void retainsCallbackUntilPeerDeletionDrainsScheduledCallbacks() throws InterruptedException {
-        BlockedPeer blockedPeer = createPeerWithBlockedCallback();
-        AtomicReference<Throwable> deletionFailure = new AtomicReference<>();
-        AtomicInteger deletionResult = new AtomicInteger();
-        CountDownLatch deletionStarted = new CountDownLatch(1);
-        Thread deletionThread = new Thread(() -> {
-            deletionStarted.countDown();
-            try {
-                deletionResult.set(rtcDeletePeerConnection(blockedPeer.peerHandle));
-            } catch (Throwable failure) {
-                deletionFailure.set(failure);
+    @Timeout(300)
+    void peerDeletionKeepsCallbackStateUntilScheduledCallbacksReturn() throws Exception {
+        String java = Paths.get(System.getProperty("java.home"), "bin", "java").toString();
+        Process process = new ProcessBuilder(java, "-cp", System.getProperty("java.class.path"), Churn.class.getName())
+                .redirectErrorStream(true)
+                .start();
+
+        String output;
+        try (InputStream stdout = process.getInputStream()) {
+            output = readFully(stdout);
+        }
+        process.waitFor();
+
+        assertEquals(0, process.exitValue(), "the churn process died, its output was:\n" + output);
+    }
+
+    private static String readFully(InputStream stream) throws IOException {
+        byte[] buffer = new byte[8192];
+        StringBuilder text = new StringBuilder();
+        int read;
+        while ((read = stream.read(buffer)) != -1) {
+            text.append(new String(buffer, 0, read, StandardCharsets.UTF_8));
+        }
+        return text.toString();
+    }
+
+    /**
+     * Repeatedly parks a peer connection inside one of its callbacks, deletes the peer from another thread and then
+     * lets the callback return, so that the callbacks queued behind it are delivered while the deletion is waiting.
+     */
+    public static final class Churn {
+        private static final int ITERATIONS = 100;
+        private static final long TIMEOUT_SECONDS = 10;
+
+        public static void main(String[] args) throws Exception {
+            // holding on to the peers keeps their cleaners from deleting handles that have since been reused
+            List<PeerConnection> peers = new ArrayList<>();
+            for (int i = 0; i < ITERATIONS; i++) {
+                peers.add(deleteWhileCallbackIsRunning());
             }
-        }, "peer-deletion-test");
-
-        boolean dispatchCallback = false;
-        try {
-            deletionThread.start();
-            assertTrue(deletionStarted.await(1, TimeUnit.SECONDS));
-            awaitDeletionBlock(deletionThread);
-
-            forceGarbageCollection();
-            assertNotNull(blockedPeer.listener.get(),
-                    "peer deletion released its callback before the blocked native callback returned");
-            dispatchCallback = true;
-        } finally {
-            releaseSignalingStateCallback(dispatchCallback);
-            deletionThread.join(CALLBACK_TIMEOUT_MILLIS);
+            System.out.println("survived " + ITERATIONS + " deletions, kept " + peers.size() + " peers");
         }
 
-        assertFalse(deletionThread.isAlive(), "peer deletion did not finish after the callback returned");
-        assertNull(deletionFailure.get());
-        assertEquals(0, deletionResult.get());
-        assertEquals(1, blockedPeer.callbackCount.get());
-    }
+        private static PeerConnection deleteWhileCallbackIsRunning() throws Exception {
+            CountDownLatch callbackEntered = new CountDownLatch(1);
+            CountDownLatch releaseCallback = new CountDownLatch(1);
 
-    private static BlockedPeer createPeerWithBlockedCallback() {
-        PeerConnectionConfiguration configuration = PeerConnectionConfiguration.DEFAULT
-                .withDisableAutoNegotiation(true);
-        PeerConnection peer = PeerConnection.createPeer(configuration);
-        DataChannel channel = peer.createDataChannel("lifecycle-test");
-        AtomicInteger callbackCount = new AtomicInteger();
-        peer.onSignalingStateChange.register((ignoredPeer, ignoredState) -> callbackCount.incrementAndGet());
+            PeerConnectionConfiguration config = PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true);
+            PeerConnection peer = PeerConnection.createPeer(config);
+            peer.onSignalingStateChange.register((ignoredPeer, ignoredState) -> {
+                callbackEntered.countDown();
+                await(releaseCallback);
+            });
+            // these queue up behind the parked callback and are drained while the deletion waits
+            peer.onLocalDescription.register((ignoredPeer, ignoredSdp, ignoredType) -> {});
+            peer.onLocalCandidate.register((ignoredPeer, ignoredCandidate, ignoredMediaId) -> {});
+            peer.onGatheringStateChange.register((ignoredPeer, ignoredState) -> {});
+            peer.onStateChange.register((ignoredPeer, ignoredState) -> {});
+            peer.createDataChannel("callback-lifecycle");
+            peer.setLocalDescription("offer");
 
-        armSignalingStateCallback();
-        peer.setLocalDescription("offer");
-        boolean callbackEntered = awaitSignalingStateCallback(CALLBACK_TIMEOUT_MILLIS);
-        if (!callbackEntered) {
-            releaseSignalingStateCallback(false);
+            if (!callbackEntered.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("the signaling state callback never ran");
+            }
+
+            Thread deletion = new Thread(() -> rtcDeletePeerConnection(peer.peerHandle), "peer-deletion");
+            deletion.start();
+            // let the deletion reach the point where it waits for the scheduled callbacks
+            Thread.sleep(50);
+            releaseCallback.countDown();
+            deletion.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+            if (deletion.isAlive()) {
+                throw new IllegalStateException("the peer deletion never returned");
+            }
+            return peer;
         }
-        assertTrue(callbackEntered, "the native signaling callback did not start");
 
-        channel.close();
-        return new BlockedPeer(peer.peerHandle, new WeakReference<>(peer.listener), callbackCount);
-    }
-
-    private static void awaitDeletionBlock(Thread deletionThread) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (deletionThread.isAlive() && deletionThread.getState() == Thread.State.RUNNABLE
-                && System.nanoTime() < deadline) {
-            Thread.sleep(10);
-        }
-        assertTrue(deletionThread.isAlive(), "peer deletion returned before the native callback was released");
-    }
-
-    private static void forceGarbageCollection() throws InterruptedException {
-        for (int attempt = 0; attempt < 10; attempt++) {
-            System.gc();
-            System.runFinalization();
-            Thread.sleep(20);
-        }
-    }
-
-    private static final class BlockedPeer {
-        private final int peerHandle;
-        private final WeakReference<PeerConnectionListener> listener;
-        private final AtomicInteger callbackCount;
-
-        private BlockedPeer(int peerHandle, WeakReference<PeerConnectionListener> listener,
-                            AtomicInteger callbackCount) {
-            this.peerHandle = peerHandle;
-            this.listener = listener;
-            this.callbackCount = callbackCount;
+        private static void await(CountDownLatch latch) {
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 }
