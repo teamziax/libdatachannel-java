@@ -438,11 +438,11 @@ val githubActions by tasks.registering(DefaultTask::class) {
 val configureNativeProbe by tasks.registering(Exec::class) {
     dependsOn(tasks.compileJava)
     commandLine("cmake", "-S", "jni", "-B", "build/native-probe", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-        "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON", "-DWARDEN_ADMISSION_TESTS=ON")
+        "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON", "-DWARDEN_ADMISSION_TESTS=ON", "-DRAW_MUX_TESTS=ON")
 }
 val compileNativeProbe by tasks.registering(Exec::class) {
     dependsOn(configureNativeProbe)
-    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "admission-teardown-test", "-j4")
+    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "admission-teardown-test", "raw-mux-test", "ice-attribute-limits-test", "-j4")
 }
 val probeSourceSet = sourceSets.create("nativeProbe") {
     java.srcDir("native-test")
@@ -465,7 +465,7 @@ val probeIdentity by tasks.registering(Exec::class) {
 }
 val runAdmissionNativeTests by tasks.registering(Exec::class) {
     dependsOn(compileNativeProbe)
-    commandLine("ctest", "--test-dir", "build/native-probe/libdatachannel", "--output-on-failure", "-R", "admission-teardown")
+    commandLine("ctest", "--test-dir", "build/native-probe/libdatachannel", "--output-on-failure", "-R", "admission-teardown|raw-mux|ice-attribute-limits")
 }
 tasks.register<JavaExec>("nativeAdmissionProbe") {
     dependsOn(runAdmissionNativeTests, probeIdentity, tasks.named(probeSourceSet.classesTaskName), "nativeCallbackCleanupProbe")

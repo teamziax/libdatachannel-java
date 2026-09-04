@@ -31,6 +31,14 @@ Callback work must be bounded and must not call native APIs. The listener copies
 packet bytes into Java, fails closed on handler exceptions, and waits for native
 callbacks before releasing its global reference on close.
 
+`RawUdpMuxListener.replay` copies a retained STUN request into the mux's bounded
+queue after peer setup. It must run outside callbacks. Delivery runs on the mux
+thread through the current raw guard again, followed by normal ICE handling;
+it does not bypass authentication or construct a separate STUN response. The
+queue holds up to 1024 requests of at most 2048 bytes and is cleared on listener
+removal. Closed listeners, invalid arguments and unavailable/full queues fail
+explicitly. Packet-processing counters include these internal replays.
+
 From a clean commit, `scripts/package-admission-development.sh [maven-directory]`
 produces an immutable `dev.ziax.warden:libdatachannel-java:0.24.1.1-warden.<full SHA>`
 Java jar and Linux x86_64 classifier jar. It tests first and only writes the explicit

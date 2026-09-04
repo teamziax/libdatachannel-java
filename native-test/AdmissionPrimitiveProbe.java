@@ -116,6 +116,8 @@ public final class AdmissionPrimitiveProbe {
         Set<String> approved=ConcurrentHashMap.newKeySet(), claimed=ConcurrentHashMap.newKeySet();
         AtomicInteger rejected=new AtomicInteger(),created=new AtomicInteger(),rawPackets=new AtomicInteger();
         AtomicReference<Throwable> failure=new AtomicReference<>();
+        AtomicReference<byte[]> initialPacket=new AtomicReference<>();
+        AtomicInteger initialPort=new AtomicInteger();
         List<PeerConnection> hosts=new ArrayList<>();
         CountDownLatch messages=new CountDownLatch(2), opened=new CountDownLatch(2);
         AtomicInteger channelMask=new AtomicInteger(), callbackCloseGuards=new AtomicInteger();
@@ -126,7 +128,10 @@ public final class AdmissionPrimitiveProbe {
             try {
                 Admission admission=validate(packet,tuple);
                 if(admission==null) {rejected.incrementAndGet();return false;}
-                if(claimed.add(admission.token())) check(work.offer(admission),"bounded creation queue");
+                if(claimed.add(admission.token())) {
+                    initialPacket.set(packet); initialPort.set(port);
+                    check(work.offer(admission),"bounded creation queue");
+                }
             } catch(Exception error) {rejected.incrementAndGet();}
             return false;
         });PeerConnection client=PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true).withBindAddress(LOOPBACK))) {
@@ -178,6 +183,7 @@ public final class AdmissionPrimitiveProbe {
             check(field(host.localDescription(),"fingerprint").equals("sha-256 "+hostFingerprint),"published native certificate identity");
             check(field(host.localDescription(),"ice-ufrag").equals(token),"native did not truncate token");
             approved.add(admitted.tuple());
+            mux.replay(initialPacket.getAndSet(null),LOOPBACK,initialPort.get());
             if(wrongFingerprint) {
                 check(hostFailed.await(15,TimeUnit.SECONDS),"DTLS rejects authenticated token with wrong client fingerprint");
                 check(channelMask.get()==0 && opened.getCount()==2,"wrong certificate opens no channels");
