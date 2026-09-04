@@ -10,7 +10,7 @@ if test -n "$(git status --porcelain --untracked-files=normal)"; then
 fi
 revision=$(git rev-parse HEAD)
 version="0.24.1.1-warden.${revision}"
-./gradlew jar nativeAdmissionProbe --no-daemon -Plibdatachannel.java-compiler-version=17
+./gradlew :classes :nativeAdmissionProbe --no-daemon -Plibdatachannel.java-compiler-version=17
 python3 - "$output" "$version" <<'PY'
 import pathlib, sys, zipfile
 output, version = pathlib.Path(sys.argv[1]), sys.argv[2]
