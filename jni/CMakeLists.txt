@@ -54,6 +54,7 @@ add_library(datachannel-java SHARED
         src/util.c
         src/native_channel.c
         src/native_peer.c
+        src/native_mux.c
         src/native_track.c
         src/callback.c)
-target_link_libraries(datachannel-java PRIVATE datachannel-static)
+target_link_libraries(datachannel-java PRIVATE datachannel-static juice)

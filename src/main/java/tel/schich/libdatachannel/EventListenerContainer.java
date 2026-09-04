@@ -12,6 +12,8 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 public class EventListenerContainer<T> implements Closeable {
+    private static final ThreadLocal<Boolean> IN_CALLBACK = ThreadLocal.withInitial(() -> false);
+    static boolean inCallback() { return IN_CALLBACK.get(); }
     private static final Logger LOGGER = LoggerFactory.getLogger(EventListenerContainer.class);
 
     private final String eventName;
@@ -40,6 +42,9 @@ public class EventListenerContainer<T> implements Closeable {
             return;
         }
         executor.execute(() -> {
+            boolean previous = IN_CALLBACK.get();
+            IN_CALLBACK.set(true);
+            try {
             for (T listener : this.listeners) {
                 try {
                     invoker.accept(listener);
@@ -47,6 +52,7 @@ public class EventListenerContainer<T> implements Closeable {
                     LOGGER.error("Handler for event {} failed!", eventName, t);
                 }
             }
+            } finally { if (previous) IN_CALLBACK.set(true); else IN_CALLBACK.remove(); }
         });
     }
 
