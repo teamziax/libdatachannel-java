@@ -53,3 +53,11 @@ now holds an explicit extra ICE reference, waits for the teardown task to finish
 and requires the bounded API to report timeout while the agent remains. The
 completion hook counts actual transport destruction, without blocking the teardown
 worker. Releasing the last reference completes the wait and leaves zero agents.
+
+`nativeAdmissionProbe` also runs `nativeCallbackCleanupProbe`. This regression
+creates and deletes 100 peers with the two-channel callback layout used by the
+admission host, alternating `close()` and `closeAndAwait()`. It captures native
+errors and checks that all 300 peer/channel wrappers become collectible after
+explicit close, which also checks release of the JNI listener global references.
+The old callback teardown order produces exactly eight invalid-handle errors per
+peer; callbacks must be unregistered before their channel/peer handle is deleted.

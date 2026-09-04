@@ -449,6 +449,9 @@ val probeSourceSet = sourceSets.create("nativeProbe") {
     compileClasspath += sourceSets.main.get().output + configurations.compileClasspath.get()
     runtimeClasspath += sourceSets.main.get().output + configurations.runtimeClasspath.get()
 }
+dependencies {
+    add(probeSourceSet.implementationConfigurationName, libs.logbackClassic)
+}
 tasks.named<JavaCompile>(probeSourceSet.compileJavaTaskName) {
     javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(17) }
     options.release = 17
@@ -465,10 +468,18 @@ val runAdmissionNativeTests by tasks.registering(Exec::class) {
     commandLine("ctest", "--test-dir", "build/native-probe/libdatachannel", "--output-on-failure", "-R", "admission-teardown")
 }
 tasks.register<JavaExec>("nativeAdmissionProbe") {
-    dependsOn(runAdmissionNativeTests, probeIdentity, tasks.named(probeSourceSet.classesTaskName))
+    dependsOn(runAdmissionNativeTests, probeIdentity, tasks.named(probeSourceSet.classesTaskName), "nativeCallbackCleanupProbe")
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
     classpath = probeSourceSet.runtimeClasspath
     mainClass = "tel.schich.libdatachannel.AdmissionPrimitiveProbe"
     systemProperty("libdatachannel.native.datachannel-java.path", layout.buildDirectory.file("native-probe/libdatachannel-java.so").get().asFile.absolutePath)
     args("build/probe-identity/cert.pem", "build/probe-identity/key.pem")
+}
+
+tasks.register<JavaExec>("nativeCallbackCleanupProbe") {
+    dependsOn(compileNativeProbe, tasks.named(probeSourceSet.classesTaskName))
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    classpath = probeSourceSet.runtimeClasspath
+    mainClass = "tel.schich.libdatachannel.CallbackCleanupProbe"
+    systemProperty("libdatachannel.native.datachannel-java.path", layout.buildDirectory.file("native-probe/libdatachannel-java.so").get().asFile.absolutePath)
 }
