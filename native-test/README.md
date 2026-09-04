@@ -35,7 +35,7 @@ callbacks before releasing its global reference on close.
 queue after peer setup. It must run outside callbacks. Delivery runs on the mux
 thread through the current raw guard again, followed by normal ICE handling;
 it does not bypass authentication or construct a separate STUN response. The
-queue holds up to 64 requests of at most 2048 bytes and is cleared on listener
+queue holds up to 1024 requests of at most 2048 bytes and is cleared on listener
 removal. Closed listeners, invalid arguments and unavailable/full queues fail
 explicitly. Packet-processing counters include these internal replays.
 

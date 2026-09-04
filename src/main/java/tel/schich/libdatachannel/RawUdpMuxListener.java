@@ -53,7 +53,7 @@ public final class RawUdpMuxListener implements AutoCloseable {
      * Queue a retained STUN request after its peer has been configured. The native
      * mux thread re-runs the current handler before ordinary ICE processing, so
      * expired/cancelled reservations cannot bypass admission. Copies at most
-     * 2048 bytes into a queue bounded to 64 packets; failure throws. No callbacks
+     * 2048 bytes into a queue bounded to 1024 packets; failure throws. No callbacks
      * run inline. Must be called outside the ingress callback.
      */
     public void replay(byte[] packet, InetAddress sourceAddress, int sourcePort) {
