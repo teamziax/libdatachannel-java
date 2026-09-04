@@ -45,3 +45,11 @@ success, and then checks zero agents after successful completion. The Java host
 uses `closeAndAwait(Duration)` on its external owner thread before freeing
 capacity; this method rejects calls from mux/event callbacks. The primitive
 probe retains the immediate zero-agent assertion between endpoint reuses.
+
+Worker CI run 33830909678 exposed a remaining transport-reference race in the
+initial completion hook: the teardown task had released its references, while
+another callback/task still retained the ICE transport. The native regression
+now holds an explicit extra ICE reference, waits for the teardown task to finish,
+and requires the bounded API to report timeout while the agent remains. The
+completion hook counts actual transport destruction, without blocking the teardown
+worker. Releasing the last reference completes the wait and leaves zero agents.
