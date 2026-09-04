@@ -118,7 +118,7 @@ public final class AdmissionPrimitiveProbe {
         AtomicReference<Throwable> failure=new AtomicReference<>();
         List<PeerConnection> hosts=new ArrayList<>();
         CountDownLatch messages=new CountDownLatch(2), opened=new CountDownLatch(2);
-        AtomicInteger channelMask=new AtomicInteger();
+        AtomicInteger channelMask=new AtomicInteger(), callbackCloseGuards=new AtomicInteger();
         CountDownLatch hostFailed=new CountDownLatch(1);
         try(RawUdpMuxListener mux=new RawUdpMuxListener(LOOPBACK,PORT,(packet,address,port)->{
             rawPackets.incrementAndGet(); String tuple=address+":"+port;
@@ -142,7 +142,10 @@ public final class AdmissionPrimitiveProbe {
                 String label=channel==0?"ReliableDataChannel":"UnreliableDataChannel";
                 var init=DataChannelInitSettings.DEFAULT.withReliability(new DataChannelReliability(channel==1,channel==1,0,0));
                 var dc=client.createDataChannel(label,init);clientChannels.add(dc);
-                dc.onOpen.register(d->{opened.countDown();ByteBuffer message=ByteBuffer.allocateDirect(2);message.put((byte)0).put((byte)(label.startsWith("Reliable")?1:2)).flip();d.sendMessage(message);});
+                dc.onOpen.register(d->{
+                    try { client.closeAndAwait(java.time.Duration.ofMillis(1)); failure.set(new AssertionError("teardown wait must reject callback context")); }
+                    catch(IllegalStateException expected) { callbackCloseGuards.incrementAndGet(); }
+                    opened.countDown();ByteBuffer message=ByteBuffer.allocateDirect(2);message.put((byte)0).put((byte)(label.startsWith("Reliable")?1:2)).flip();d.sendMessage(message);});
             }
             client.setLocalDescription("offer","clientFixtureUf","p".repeat(passwordLength));
             String token=mint(client.localDescription(),passwordLength,wrongFingerprint);
@@ -179,16 +182,16 @@ public final class AdmissionPrimitiveProbe {
                 check(hostFailed.await(15,TimeUnit.SECONDS),"DTLS rejects authenticated token with wrong client fingerprint");
                 check(channelMask.get()==0 && opened.getCount()==2,"wrong certificate opens no channels");
                 System.out.println("native-spike PASS wrongClientFingerprint=dtls-rejected channels=0 perJoinControl=0");
-                for(PeerConnection peer:hosts) peer.close();hosts.clear();
+                for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");hosts.clear();
                 return;
             }
             check(opened.await(10,TimeUnit.SECONDS),"both client channels open");
             check(messages.await(10,TimeUnit.SECONDS),"both channels deliver distinct binary messages");
-            check(failure.get()==null,"native callbacks completed without failure");
+            check(failure.get()==null && callbackCloseGuards.get()==2,"native callbacks completed without failure and cannot wait on themselves");
             check(created.get()==1 && work.isEmpty() && channelMask.get()==3,"one lazy peer and both channels");
             long[] stats=mux.stats();check(stats[2]==1 && stats[3]==1,"one fixed-port agent and tuple");
             System.out.println("native-spike PASS ufragChars="+token.length()+" passwordBytes="+passwordLength+" hostPeers="+created.get()+" rawPackets="+rawPackets.get()+" channels=3 perJoinControl=0");
-            for(PeerConnection peer:hosts) peer.close();hosts.clear();
-        } finally {for(PeerConnection peer:hosts) peer.close();}
+            for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");hosts.clear();
+        } finally {for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");}
     }
 }

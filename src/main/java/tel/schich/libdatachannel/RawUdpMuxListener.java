@@ -69,7 +69,7 @@ public final class RawUdpMuxListener implements AutoCloseable {
         }
     }
 
-    private static void outsideCallback() {
+    static void outsideCallback() {
         if (IN_CALLBACK.get()) throw new IllegalStateException("Native mux APIs cannot run in an ingress callback");
     }
     private native long openNative(String address, int port);

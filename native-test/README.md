@@ -36,3 +36,12 @@ produces an immutable `dev.ziax.warden:libdatachannel-java:0.24.1.1-warden.<full
 Java jar and Linux x86_64 classifier jar. It tests first and only writes the explicit
 local destination. It does not upload, merge or deploy. The original Maven group
 and normal platform release build remain separate.
+
+The probe now includes a deterministic C++ teardown regression. CI demonstrated
+that ordinary peer deletion can return before the ICE agent is destroyed. The
+regression deliberately stalls the native teardown worker, proves the old API's
+behavior, checks that the bounded completion API reports timeout rather than
+success, and then checks zero agents after successful completion. The Java host
+uses `closeAndAwait(Duration)` on its external owner thread before freeing
+capacity; this method rejects calls from mux/event callbacks. The primitive
+probe retains the immediate zero-agent assertion between endpoint reuses.

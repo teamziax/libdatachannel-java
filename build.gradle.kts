@@ -438,11 +438,11 @@ val githubActions by tasks.registering(DefaultTask::class) {
 val configureNativeProbe by tasks.registering(Exec::class) {
     dependsOn(tasks.compileJava)
     commandLine("cmake", "-S", "jni", "-B", "build/native-probe", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
-        "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON")
+        "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON", "-DWARDEN_ADMISSION_TESTS=ON")
 }
 val compileNativeProbe by tasks.registering(Exec::class) {
     dependsOn(configureNativeProbe)
-    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "-j4")
+    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "admission-teardown-test", "-j4")
 }
 val probeSourceSet = sourceSets.create("nativeProbe") {
     java.srcDir("native-test")
@@ -460,8 +460,12 @@ val probeIdentity by tasks.registering(Exec::class) {
     commandLine("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
         "-nodes", "-days", "1", "-subj", "/CN=native-probe", "-keyout", "build/probe-identity/key.pem", "-out", "build/probe-identity/cert.pem")
 }
+val runAdmissionNativeTests by tasks.registering(Exec::class) {
+    dependsOn(compileNativeProbe)
+    commandLine("ctest", "--test-dir", "build/native-probe/libdatachannel", "--output-on-failure", "-R", "admission-teardown")
+}
 tasks.register<JavaExec>("nativeAdmissionProbe") {
-    dependsOn(compileNativeProbe, probeIdentity, tasks.named(probeSourceSet.classesTaskName))
+    dependsOn(runAdmissionNativeTests, probeIdentity, tasks.named(probeSourceSet.classesTaskName))
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
     classpath = probeSourceSet.runtimeClasspath
     mainClass = "tel.schich.libdatachannel.AdmissionPrimitiveProbe"
