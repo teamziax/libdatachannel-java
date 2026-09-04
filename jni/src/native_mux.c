@@ -88,3 +88,21 @@ JNIEXPORT jlongArray JNICALL Java_tel_schich_libdatachannel_RawUdpMuxListener_st
     if (result) (*env)->SetLongArrayRegion(env, result, 0, 4, values);
     return result;
 }
+
+JNIEXPORT void JNICALL Java_tel_schich_libdatachannel_RawUdpMuxListener_replayNative(
+    JNIEnv *env, jclass clazz, jlong handle, jbyteArray packet, jstring source_address, jint source_port) {
+    struct raw_mux *mux = (struct raw_mux *)(intptr_t)handle;
+    jsize size = (*env)->GetArrayLength(env, packet);
+    if (size < 20 || size > 2048) {
+        throw_native_exception(env, "Invalid deferred STUN size");
+        return;
+    }
+    unsigned char data[2048];
+    (*env)->GetByteArrayRegion(env, packet, 0, size, (jbyte *)data);
+    if ((*env)->ExceptionCheck(env)) return;
+    const char *source = (*env)->GetStringUTFChars(env, source_address, NULL);
+    if (!source) return;
+    int result = juice_mux_replay(mux->address, mux->port, source, source_port, data, (size_t)size);
+    (*env)->ReleaseStringUTFChars(env, source_address, source);
+    if (result != 0) throw_native_exception(env, "Cannot queue deferred STUN request");
+}
