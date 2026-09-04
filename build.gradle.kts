@@ -432,3 +432,39 @@ val githubActions by tasks.registering(DefaultTask::class) {
         dependsOn(tasks.assemble)
     }
 }
+
+// Focused local JNI spike using the existing library/package format.
+// Uses system OpenSSL; the established dockcross release path remains available.
+val configureNativeProbe by tasks.registering(Exec::class) {
+    dependsOn(tasks.compileJava)
+    commandLine("cmake", "-S", "jni", "-B", "build/native-probe", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON")
+}
+val compileNativeProbe by tasks.registering(Exec::class) {
+    dependsOn(configureNativeProbe)
+    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "-j4")
+}
+val probeSourceSet = sourceSets.create("nativeProbe") {
+    java.srcDir("native-test")
+    compileClasspath += sourceSets.main.get().output + configurations.compileClasspath.get()
+    runtimeClasspath += sourceSets.main.get().output + configurations.runtimeClasspath.get()
+}
+tasks.named<JavaCompile>(probeSourceSet.compileJavaTaskName) {
+    javaCompiler = javaToolchains.compilerFor { languageVersion = JavaLanguageVersion.of(17) }
+    options.release = 17
+}
+val probeIdentity by tasks.registering(Exec::class) {
+    val dir = layout.buildDirectory.dir("probe-identity")
+    outputs.dir(dir)
+    doFirst { dir.get().asFile.mkdirs() }
+    commandLine("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+        "-nodes", "-days", "1", "-subj", "/CN=native-probe", "-keyout", "build/probe-identity/key.pem", "-out", "build/probe-identity/cert.pem")
+}
+tasks.register<JavaExec>("nativeAdmissionProbe") {
+    dependsOn(compileNativeProbe, probeIdentity, tasks.named(probeSourceSet.classesTaskName))
+    javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
+    classpath = probeSourceSet.runtimeClasspath
+    mainClass = "tel.schich.libdatachannel.AdmissionPrimitiveProbe"
+    systemProperty("libdatachannel.native.datachannel-java.path", layout.buildDirectory.file("native-probe/libdatachannel-java.so").get().asFile.absolutePath)
+    args("build/probe-identity/cert.pem", "build/probe-identity/key.pem")
+}
