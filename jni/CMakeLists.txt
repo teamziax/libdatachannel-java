@@ -12,7 +12,7 @@ set(NO_TESTS ON CACHE BOOL "configure libdatachannel build")
 set(NO_EXAMPLES ON CACHE BOOL "configure libdatachannel build")
 add_subdirectory(libdatachannel)
 
-include_directories(libdatachannel/include generated)
+include_directories(libdatachannel/include libdatachannel/deps/libjuice/include generated)
 include_directories(jdk)
 if(WIN32)
     include_directories(jdk/windows)
@@ -54,6 +54,7 @@ add_library(datachannel-java SHARED
         src/util.c
         src/native_channel.c
         src/native_peer.c
+        src/native_mux.c
         src/native_track.c
         src/callback.c)
 target_link_libraries(datachannel-java PRIVATE datachannel-static)

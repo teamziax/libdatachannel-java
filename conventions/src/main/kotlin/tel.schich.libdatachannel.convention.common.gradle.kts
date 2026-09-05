@@ -20,8 +20,9 @@ tasks.test {
 }
 
 tasks.compileJava {
+    options.release = 11
     javaCompiler = javaToolchains.compilerFor {
-        languageVersion = JavaLanguageVersion.of(11)
+        languageVersion = JavaLanguageVersion.of(providers.gradleProperty("libdatachannel.java-compiler-version").getOrElse("11").toInt())
     }
 }
 

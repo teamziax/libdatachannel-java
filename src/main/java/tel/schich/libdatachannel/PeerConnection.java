@@ -213,6 +213,23 @@ public class PeerConnection implements Closeable {
     }
 
     /**
+     * Force-close and await native transport teardown before deleting the peer.
+     * Call only from an external owner thread, never a native callback. A timeout
+     * returns false and retains ownership so the caller can retry or fail closed.
+     */
+    public boolean closeAndAwait(java.time.Duration timeout) {
+        RawUdpMuxListener.outsideCallback();
+        if (EventListenerContainer.inCallback()) throw new IllegalStateException("Cannot await teardown from a native event callback");
+        long millis = timeout.toMillis();
+        if (millis < 1 || millis > 30_000) throw new IllegalArgumentException("Teardown timeout must be 1..30000 ms");
+        int result = LibDataChannelNative.rtcClosePeerConnectionAndWait(peerHandle, (int)millis);
+        if (result == -3) return false; // RTC_ERR_NOT_AVAIL
+        if (result != 0) throw new IllegalStateException("Native close failed: " + result);
+        close();
+        return true;
+    }
+
+    /**
      * Closes all Data Channels.
      */
     public void closeChannels() {
