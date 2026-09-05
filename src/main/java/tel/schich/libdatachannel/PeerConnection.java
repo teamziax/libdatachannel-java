@@ -1,6 +1,9 @@
 package tel.schich.libdatachannel;
 
 import org.eclipse.jdt.annotation.Nullable;
+import java.nio.file.Path;
+import static tel.schich.libdatachannel.LibDataChannelNative.rtcCreatePeerConnectionWithIdentity;
+import static tel.schich.libdatachannel.LibDataChannelNative.rtcSetLocalDescriptionWithIce;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -111,15 +114,30 @@ public class PeerConnection implements Closeable {
      * @return the peer connection
      */
     public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor) {
+        return createPeer(config, executor, null, null);
+    }
+
+    /** Creates a peer using a paired PEM DTLS certificate/key, or the default identity if both null. */
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
+                                           @Nullable Path certificate, @Nullable Path key) {
+        return createPeer(config, executor, certificate, key, null);
+    }
+
+    /** Imports an endpoint identity using the upstream native certificate configuration. */
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
+                                           @Nullable Path certificate, @Nullable Path key,
+                                           @Nullable String keyPassword) {
+        if ((certificate == null) != (key == null)) throw new IllegalArgumentException("Certificate/key must be paired");
+        if (keyPassword != null && key == null) throw new IllegalArgumentException("A key password requires an identity");
         String proxyServer = null;
         if (config.proxyServer != null) {
             proxyServer = config.proxyServer.toASCIIString();
         }
         String bindAddress = null;
         if (config.bindAddress != null) {
-            bindAddress = config.bindAddress.toString();
+            bindAddress = config.bindAddress.getHostAddress();
         }
-        int result = rtcCreatePeerConnection(
+        int result = rtcCreatePeerConnectionWithIdentity(
                 iceUrisToStrings(config.iceServers),
                 proxyServer,
                 bindAddress,
@@ -132,13 +150,18 @@ public class PeerConnection implements Closeable {
                 config.portRangeBegin,
                 config.portRangeEnd,
                 config.mtu,
-                config.maxMessageSize);
+                config.maxMessageSize,
+                certificate == null ? null : certificate.toString(),
+                key == null ? null : key.toString(), keyPassword);
 
         final PeerConnection peer = new PeerConnection(wrapError("rtcCreatePeerConnection", result), executor);
         setupPeerConnectionListener(peer.peerHandle, peer.listener);
 
         return peer;
     }
+
+    /** Diagnostic count at the native C API construction boundary, including failed attempts. */
+    public static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
 
     public static PeerConnection createPeer(PeerConnectionConfiguration config) {
         return createPeer(config, Runnable::run);
@@ -212,6 +235,12 @@ public class PeerConnection implements Closeable {
      *
      * @param type (optional): type of the description ("offer", "answer", "pranswer", or "rollback") or NULL for autodetection.
      */
+    /** Installs the exact local ICE credentials before gathering starts. */
+    public void setLocalDescription(@Nullable String type, String ufrag, String password) {
+        if (ufrag.isEmpty() || password.isEmpty()) throw new IllegalArgumentException("ICE credentials required");
+        wrapError("rtcSetLocalDescriptionWithIce", rtcSetLocalDescriptionWithIce(peerHandle, type, ufrag, password));
+    }
+
     public void setLocalDescription(String type) {
         wrapError("rtcSetLocalDescription", rtcSetLocalDescription(peerHandle, type));
     }

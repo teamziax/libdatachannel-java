@@ -48,8 +48,7 @@ void RTC_API handle_track(int pc, int trackHandle, void* ptr) {
 }
 SET_CALLBACK_INTERFACE_IMPL(rtcSetTrackCallback, handle_track)
 
-JNIEXPORT jint JNICALL
-Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIEnv* env, jclass clazz,
+static jint create_peer(JNIEnv* env, jclass clazz,
                                                                             jobjectArray iceServers, jstring proxyServer,
                                                                             jstring bindAddress, jint certificateType,
                                                                             jint iceTransportPolicy,
@@ -58,7 +57,7 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIE
                                                                             jboolean disableAutoNegotiation,
                                                                             jboolean forceMediaTransport,
                                                                             jshort portRangeBegin, jshort portRangeEnd,
-                                                                            jint mtu, jint maxMessageSize) {
+                                                                            jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword) {
     rtcConfiguration config = {
             .certificateType = certificateType,
             .iceTransportPolicy = iceTransportPolicy,
@@ -110,7 +109,18 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIE
         config.bindAddress = (*env)->GetStringUTFChars(env, bindAddress, NULL);
     }
 
-    jint result = (jint) rtcCreatePeerConnection(&config);
+    const char *certificate = certificateFile ? (*env)->GetStringUTFChars(env, certificateFile, NULL) : NULL;
+    const char *key = keyFile && !(*env)->ExceptionCheck(env) ? (*env)->GetStringUTFChars(env, keyFile, NULL) : NULL;
+    const char *pass = keyPassword && !(*env)->ExceptionCheck(env) ? (*env)->GetStringUTFChars(env, keyPassword, NULL) : NULL;
+    config.certificatePemFile = certificate;
+    config.keyPemFile = key;
+    config.keyPemPass = pass;
+    jint result = EXCEPTION_THROWN;
+    if (!(*env)->ExceptionCheck(env))
+        result = (jint) rtcCreatePeerConnection(&config);
+    if (pass) (*env)->ReleaseStringUTFChars(env, keyPassword, pass);
+    if (certificate) (*env)->ReleaseStringUTFChars(env, certificateFile, certificate);
+    if (key) (*env)->ReleaseStringUTFChars(env, keyFile, key);
 
     if (proxyServer != NULL) {
         (*env)->ReleaseStringUTFChars(env, proxyServer, config.proxyServer);
@@ -128,6 +138,35 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIE
     }
 
     return result;
+}
+
+
+JNIEXPORT jint JNICALL
+Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIEnv* env, jclass clazz,
+                                                                            jobjectArray iceServers, jstring proxyServer,
+                                                                            jstring bindAddress, jint certificateType,
+                                                                            jint iceTransportPolicy,
+                                                                            jboolean enableIceTcp,
+                                                                            jboolean enableIceUdpMux,
+                                                                            jboolean disableAutoNegotiation,
+                                                                            jboolean forceMediaTransport,
+                                                                            jshort portRangeBegin, jshort portRangeEnd,
+                                                                            jint mtu, jint maxMessageSize) {
+    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, NULL, NULL, NULL);
+}
+
+JNIEXPORT jint JNICALL
+Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnectionWithIdentity(JNIEnv* env, jclass clazz,
+                                                                            jobjectArray iceServers, jstring proxyServer,
+                                                                            jstring bindAddress, jint certificateType,
+                                                                            jint iceTransportPolicy,
+                                                                            jboolean enableIceTcp,
+                                                                            jboolean enableIceUdpMux,
+                                                                            jboolean disableAutoNegotiation,
+                                                                            jboolean forceMediaTransport,
+                                                                            jshort portRangeBegin, jshort portRangeEnd,
+                                                                            jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword) {
+    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword);
 }
 
 JNIEXPORT jint JNICALL
@@ -272,3 +311,20 @@ JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_setup
 
     return RTC_ERR_SUCCESS;
 }
+JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rtcSetLocalDescriptionWithIce(
+    JNIEnv *env, jclass clazz, jint peer, jstring type, jstring ufrag, jstring password) {
+    const char *t = type ? (*env)->GetStringUTFChars(env, type, NULL) : NULL;
+    if (type && !t) return EXCEPTION_THROWN;
+    const char *u = (*env)->GetStringUTFChars(env, ufrag, NULL);
+    const char *p = u ? (*env)->GetStringUTFChars(env, password, NULL) : NULL;
+    rtcLocalDescriptionInit init = {.iceUfrag = u, .icePwd = p};
+    int result = p ? rtcSetLocalDescriptionEx(peer, t, &init) : EXCEPTION_THROWN;
+    if (p) (*env)->ReleaseStringUTFChars(env, password, p);
+    if (u) (*env)->ReleaseStringUTFChars(env, ufrag, u);
+    if (t) (*env)->ReleaseStringUTFChars(env, type, t);
+    return result;
+}
+
+JNIEXPORT jlong JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rtcGetPeerConnectionCreationAttempts(
+    JNIEnv *env, jclass clazz) { return (jlong)rtcGetPeerConnectionCreationAttempts(); }
+
