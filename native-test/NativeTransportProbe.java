@@ -48,6 +48,14 @@ public final class NativeTransportProbe {
         byte[] der;
         try(var input=Files.newInputStream(certificate)) { der=CertificateFactory.getInstance("X.509").generateCertificate(input).getEncoded(); }
         String hostFingerprint=HexFormat.ofDelimiter(":").withUpperCase().formatHex(MessageDigest.getInstance("SHA-256").digest(der));
+        try(PeerConnection encrypted=PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true),
+            Runnable::run,certificate,Path.of(args[2]),"test-only-password")) {
+            encrypted.createDataChannel("encrypted-key");
+            encrypted.setLocalDescription(null,"encryptedIdentity","publicTestPassword0000000");
+            check(field(encrypted.localDescription(),"fingerprint").equals("sha-256 "+hostFingerprint),"encrypted key preserves certificate identity");
+            check(encrypted.closeAndAwait(java.time.Duration.ofSeconds(5)),"encrypted-key peer cleanup");
+        }
+        System.out.println("native-transport PASS encryptedPemKey=true nullableDescriptionType=true");
         for(int ufragLength:new int[]{167,178,256}) run(certificate,key,hostFingerprint,ufragLength,false);
         run(certificate,key,hostFingerprint,167,true);
     }

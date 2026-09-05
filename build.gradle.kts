@@ -344,8 +344,18 @@ dependencies {
     compileOnly(libs.jniAccessGenerator)
 
     if (providers.gradleProperty("libdatachannel.test-native-path").isPresent) {
-        // The caller supplies a binary built from this checkout for the focused local suite.
-        tasks.test { systemProperty("libdatachannel.native.datachannel-java.path", providers.gradleProperty("libdatachannel.test-native-path").get()) }
+        // Package the selected binary on the classpath so child JVM lifecycle probes
+        // load the same checkout's library without relying on inherited properties.
+        val focusedNative = tasks.register<Jar>("packageNativeForFocusedTests") {
+            dependsOn("compileNativeProbe")
+            archiveFileName = "focused-test-native.jar"
+            destinationDirectory = layout.buildDirectory.dir("focused-test-native")
+            from(providers.gradleProperty("libdatachannel.test-native-path")) {
+                into("native")
+                rename { "libdatachannel-java.so" }
+            }
+        }
+        testImplementation(files(focusedNative))
     } else {
         testImplementation(files(packageNativeForHost))
     }
@@ -468,17 +478,24 @@ val probeIdentity by tasks.registering(Exec::class) {
     commandLine("openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
         "-nodes", "-days", "1", "-subj", "/CN=native-probe", "-keyout", "build/probe-identity/key.pem", "-out", "build/probe-identity/cert.pem")
 }
+val probeEncryptedIdentity by tasks.registering(Exec::class) {
+    dependsOn(probeIdentity)
+    inputs.file("build/probe-identity/key.pem")
+    outputs.file("build/probe-identity/key-encrypted.pem")
+    commandLine("openssl", "pkcs8", "-topk8", "-in", "build/probe-identity/key.pem",
+        "-out", "build/probe-identity/key-encrypted.pem", "-v2", "aes-256-cbc", "-passout", "pass:test-only-password")
+}
 val runTransportNativeTests by tasks.registering(Exec::class) {
     dependsOn(compileNativeProbe)
     commandLine("ctest", "--test-dir", "build/native-probe/libdatachannel", "--output-on-failure", "-R", "transport-teardown|raw-mux|ice-attribute-limits")
 }
 tasks.register<JavaExec>("nativeTransportProbe") {
-    dependsOn(runTransportNativeTests, probeIdentity, tasks.named(probeSourceSet.classesTaskName), "nativeCallbackCleanupProbe")
+    dependsOn(runTransportNativeTests, probeIdentity, probeEncryptedIdentity, tasks.named(probeSourceSet.classesTaskName), "nativeCallbackCleanupProbe")
     javaLauncher = javaToolchains.launcherFor { languageVersion = JavaLanguageVersion.of(17) }
     classpath = probeSourceSet.runtimeClasspath
     mainClass = "tel.schich.libdatachannel.NativeTransportProbe"
     systemProperty("libdatachannel.native.datachannel-java.path", layout.buildDirectory.file("native-probe/libdatachannel-java.so").get().asFile.absolutePath)
-    args("build/probe-identity/cert.pem", "build/probe-identity/key.pem")
+    args("build/probe-identity/cert.pem", "build/probe-identity/key.pem", "build/probe-identity/key-encrypted.pem")
 }
 
 tasks.register<JavaExec>("nativeCallbackCleanupProbe") {

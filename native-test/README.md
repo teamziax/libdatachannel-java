@@ -12,7 +12,9 @@ These tests reserve loopback UDP ports 49184 and 49195; the underlying mux tests
 also reserve their documented ports. Do not run competing listeners there.
 
 `NativeTransportProbe` checks supplied PEM identity and explicit ICE usernames of
-167, 178 and 256 characters with real ICE/DTLS/SCTP and two data channels. A raw
+167, 178 and 256 characters with real ICE/DTLS/SCTP and two data channels. It also
+imports a password-encrypted PEM key and verifies the expected fingerprint using
+an automatically selected local description type. A raw
 listener retains a valid initial STUN request until a peer is ready, then replays
 it through the current guard and ordinary native ICE processing. Invalid traffic
 creates no peer or tuple. An incorrect remote fingerprint fails DTLS before any
