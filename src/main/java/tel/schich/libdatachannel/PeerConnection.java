@@ -177,7 +177,7 @@ public class PeerConnection implements Closeable {
         } catch (Exception e) {
             LOGGER.warn("Failed to close channels of peer connection", e);
         }
-        cleanable.clean();
+        // Detach callbacks before the cleaner deletes their native peer handle.
         onLocalDescription.close();
         onLocalCandidate.close();
         onStateChange.close();
@@ -186,6 +186,7 @@ public class PeerConnection implements Closeable {
         onSignalingStateChange.close();
         onDataChannel.close();
         onTrack.close();
+        cleanable.clean();
     }
 
     /**
