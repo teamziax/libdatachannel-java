@@ -429,7 +429,7 @@ val githubActions by tasks.registering(DefaultTask::class) {
     val deployRefPattern = """^refs/(?:tags/v\d+\.\d+\.\d+\.\d+|heads/main)$""".toRegex()
     val ref = System.getenv("GITHUB_REF")?.ifBlank { null }?.trim()
 
-    if (ref != null && deployRefPattern.matches(ref)) {
+    if (System.getenv("GITHUB_REPOSITORY") == "pschichtel/libdatachannel-java" && ref != null && deployRefPattern.matches(ref)) {
         logger.lifecycle("Job in $ref will deploy!")
         dependsOn(mavenCentralDeploy)
     } else {
@@ -447,7 +447,7 @@ val configureNativeProbe by tasks.registering(Exec::class) {
 }
 val compileNativeProbe by tasks.registering(Exec::class) {
     dependsOn(configureNativeProbe)
-    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "transport-teardown-test", "raw-mux-test", "ice-attribute-limits-test", "-j2")
+    commandLine("cmake", "--build", "build/native-probe", "--target", "datachannel-java", "transport-teardown-test", "raw-mux-test", "raw-mux-replay-test", "raw-mux-lifetime-test", "ice-attribute-limits-test", "-j2")
 }
 val probeSourceSet = sourceSets.create("nativeProbe") {
     java.srcDir("native-test")

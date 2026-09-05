@@ -1,0 +1,41 @@
+name: Native transport regressions
+
+on:
+  push:
+    branches: [ nxs-dev ]
+  pull_request:
+    branches: [ upstream, nxs-dev ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-regressions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-java@v5
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+      - uses: gradle/actions/setup-gradle@v5
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential libssl-dev
+      - name: Native and JVM regressions
+        run: |
+          ./gradlew :nativeTransportProbe :test --no-daemon --max-workers=2 --no-configuration-cache \
+            -Plibdatachannel.java-compiler-version=17 \
+            -Plibdatachannel.test-native-path="$PWD/build/native-probe/libdatachannel-java.so"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: native-regression-reports
+          path: |
+            build/test-results/
+            build/reports/tests/
+            build/native-probe/libdatachannel/Testing/

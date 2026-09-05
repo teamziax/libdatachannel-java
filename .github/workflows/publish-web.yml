@@ -8,6 +8,7 @@ on:
 
 jobs:
   publish-web:
+    if: github.repository == 'pschichtel/libdatachannel-java'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
