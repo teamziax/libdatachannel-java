@@ -48,6 +48,14 @@ void RTC_API handle_track(int pc, int trackHandle, void* ptr) {
 }
 SET_CALLBACK_INTERFACE_IMPL(rtcSetTrackCallback, handle_track)
 
+struct incoming_peer {
+    int listener;
+    uint64_t request_id;
+    const char *remote_sdp;
+    rtcLocalDescriptionInit local_description;
+    int pc;
+};
+
 static jint create_peer(JNIEnv* env, jclass clazz,
                                                                             jobjectArray iceServers, jstring proxyServer,
                                                                             jstring bindAddress, jint certificateType,
@@ -57,7 +65,7 @@ static jint create_peer(JNIEnv* env, jclass clazz,
                                                                             jboolean disableAutoNegotiation,
                                                                             jboolean forceMediaTransport,
                                                                             jshort portRangeBegin, jshort portRangeEnd,
-                                                                            jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword) {
+                                                                            jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword, struct incoming_peer *incoming) {
     rtcConfiguration config = {
             .certificateType = certificateType,
             .iceTransportPolicy = iceTransportPolicy,
@@ -116,8 +124,11 @@ static jint create_peer(JNIEnv* env, jclass clazz,
     config.keyPemFile = key;
     config.keyPemPass = pass;
     jint result = EXCEPTION_THROWN;
-    if (!(*env)->ExceptionCheck(env))
-        result = (jint) rtcCreatePeerConnection(&config);
+    if (!(*env)->ExceptionCheck(env)) {
+        if (incoming) result = rtcPrepareIceUdpMuxPeer(incoming->listener, incoming->request_id,
+            &config, incoming->remote_sdp, &incoming->local_description, &incoming->pc);
+        else result = (jint) rtcCreatePeerConnection(&config);
+    }
     if (pass) (*env)->ReleaseStringUTFChars(env, keyPassword, pass);
     if (certificate) (*env)->ReleaseStringUTFChars(env, certificateFile, certificate);
     if (key) (*env)->ReleaseStringUTFChars(env, keyFile, key);
@@ -152,7 +163,7 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnection(JNIE
                                                                             jboolean forceMediaTransport,
                                                                             jshort portRangeBegin, jshort portRangeEnd,
                                                                             jint mtu, jint maxMessageSize) {
-    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, NULL, NULL, NULL);
+    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, NULL, NULL, NULL, NULL);
 }
 
 JNIEXPORT jint JNICALL
@@ -166,7 +177,7 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnectionWithI
                                                                             jboolean forceMediaTransport,
                                                                             jshort portRangeBegin, jshort portRangeEnd,
                                                                             jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword) {
-    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword);
+    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword, NULL);
 }
 
 JNIEXPORT jint JNICALL
@@ -331,4 +342,34 @@ JNIEXPORT jlong JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rtcG
 JNIEXPORT jint JNICALL
 Java_tel_schich_libdatachannel_LibDataChannelNative_rtcClosePeerConnectionAndWait(JNIEnv* env, jclass clazz, jint peerHandle, jint timeoutMs) {
     return rtcClosePeerConnectionAndWait(peerHandle, timeoutMs);
+}
+
+JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_prepareConfiguredNative(
+    JNIEnv *env, jclass clazz, jint listener, jlong requestId,
+    jobjectArray iceServers, jstring proxyServer, jstring bindAddress, jint certificateType,
+    jint iceTransportPolicy, jboolean enableIceTcp, jboolean enableIceUdpMux,
+    jboolean disableAutoNegotiation, jboolean forceMediaTransport,
+    jshort portRangeBegin, jshort portRangeEnd, jint mtu, jint maxMessageSize,
+    jstring certificateFile, jstring keyFile, jstring keyPassword,
+    jstring remoteDescription, jstring localUfrag, jstring localPassword) {
+    // Allocate the result before creating anything: ownership must never be lost on allocation failure.
+    jintArray result = (*env)->NewIntArray(env, 2);
+    if (!result) return NULL;
+    struct incoming_peer incoming = {.listener = listener, .request_id = (uint64_t)requestId, .pc = -1};
+    incoming.remote_sdp = (*env)->GetStringUTFChars(env, remoteDescription, NULL);
+    incoming.local_description.iceUfrag = !(*env)->ExceptionCheck(env) ? (*env)->GetStringUTFChars(env, localUfrag, NULL) : NULL;
+    incoming.local_description.icePwd = !(*env)->ExceptionCheck(env) ? (*env)->GetStringUTFChars(env, localPassword, NULL) : NULL;
+    jint status = EXCEPTION_THROWN;
+    if (!(*env)->ExceptionCheck(env)) status = create_peer(env, clazz, iceServers, proxyServer, bindAddress,
+        certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation,
+        forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize,
+        certificateFile, keyFile, keyPassword, &incoming);
+    if (incoming.remote_sdp) (*env)->ReleaseStringUTFChars(env, remoteDescription, incoming.remote_sdp);
+    if (incoming.local_description.iceUfrag) (*env)->ReleaseStringUTFChars(env, localUfrag, incoming.local_description.iceUfrag);
+    if (incoming.local_description.icePwd) (*env)->ReleaseStringUTFChars(env, localPassword, incoming.local_description.icePwd);
+    if (!(*env)->ExceptionCheck(env)) {
+        jint values[] = {status, incoming.pc};
+        (*env)->SetIntArrayRegion(env, result, 0, 2, values);
+    }
+    return result;
 }

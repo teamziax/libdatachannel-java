@@ -57,6 +57,9 @@ public class PeerConnection implements Closeable {
     private final ConcurrentMap<Integer, DataChannel> channels;
     private final ConcurrentMap<Integer, Track> tracks;
     private final Cleaner.Cleanable cleanable;
+    private volatile boolean nativeTeardownComplete;
+    private final Object preparationLock = new Object();
+    private boolean preparationOwned, preparationCloseRequested;
     final PeerConnectionListener listener;
 
     public final EventListenerContainer<PeerConnectionCallback.LocalDescription> onLocalDescription;
@@ -92,7 +95,29 @@ public class PeerConnection implements Closeable {
         });
     }
 
-    private static String @Nullable [] iceUrisToStrings(@Nullable Collection<URI> uris) {
+    static PeerConnection fromNative(int handle, Executor executor) {
+        PeerConnection peer = new PeerConnection(handle, executor);
+        peer.preparationOwned = true;
+        return peer;
+    }
+
+    boolean preparationCloseRequested() {
+        synchronized (preparationLock) { return preparationCloseRequested; }
+    }
+
+    boolean releasePreparation() {
+        synchronized (preparationLock) {
+            if (preparationCloseRequested && !nativeTeardownComplete) return false;
+            preparationOwned = false;
+            return !preparationCloseRequested;
+        }
+    }
+
+    void installNativeListener() {
+        wrapError("setupPeerConnectionListener", setupPeerConnectionListener(peerHandle, listener));
+    }
+
+    static String @Nullable [] iceUrisToStrings(@Nullable Collection<URI> uris) {
         if (uris == null || uris.isEmpty()) {
             return null;
         }
@@ -160,7 +185,7 @@ public class PeerConnection implements Closeable {
         return peer;
     }
 
-    /** Diagnostic count at the native C API construction boundary, including failed attempts. */
+    /** Diagnostic count at native peer construction, including failed attempts. */
     public static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
 
     public static PeerConnection createPeer(PeerConnectionConfiguration config) {
@@ -209,7 +234,13 @@ public class PeerConnection implements Closeable {
         onSignalingStateChange.close();
         onDataChannel.close();
         onTrack.close();
-        cleanable.clean();
+        boolean deferDeletion;
+        synchronized (preparationLock) {
+            deferDeletion = preparationOwned;
+            if (deferDeletion) preparationCloseRequested = true;
+        }
+        if (deferDeletion) rtcClosePeerConnection(peerHandle);
+        else cleanable.clean();
     }
 
     /**
@@ -218,15 +249,18 @@ public class PeerConnection implements Closeable {
      * returns false and retains ownership so the caller can retry or fail closed.
      */
     public boolean closeAndAwait(java.time.Duration timeout) {
-        RawUdpMuxListener.outsideCallback();
         if (EventListenerContainer.inCallback()) throw new IllegalStateException("Cannot await teardown from a native event callback");
         long millis = timeout.toMillis();
         if (millis < 1 || millis > 30_000) throw new IllegalArgumentException("Teardown timeout must be 1..30000 ms");
-        int result = LibDataChannelNative.rtcClosePeerConnectionAndWait(peerHandle, (int)millis);
-        if (result == -3) return false; // RTC_ERR_NOT_AVAIL
-        if (result != 0) throw new IllegalStateException("Native close failed: " + result);
-        close();
-        return true;
+        synchronized (this) {
+            if (nativeTeardownComplete) return true;
+            int result = LibDataChannelNative.rtcClosePeerConnectionAndWait(peerHandle, (int)millis);
+            if (result == -3) return false; // RTC_ERR_NOT_AVAIL
+            if (result != 0) throw new IllegalStateException("Native close failed: " + result);
+            nativeTeardownComplete = true;
+            close();
+            return true;
+        }
     }
 
     /**

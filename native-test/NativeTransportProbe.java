@@ -8,149 +8,308 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.*;
 import java.security.cert.CertificateFactory;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 
-/** Real UDP regression for imported identity, explicit ICE and deferred mux delivery. */
+/** Real UDP regression for asynchronous ICE acceptance and authenticated DTLS. */
 public final class NativeTransportProbe {
-    static final InetAddress LOOPBACK=InetAddress.getLoopbackAddress();
-    static final int PORT=49184;
-    static String field(String sdp,String name) {
-        return sdp.lines().filter(x->x.startsWith("a="+name+":")).findFirst().orElseThrow().substring(name.length()+3).trim();
+    static final InetAddress LOOPBACK = InetAddress.getLoopbackAddress();
+    static final int PORT = 49184;
+    static final String CLIENT_UFRAG = "clientFixtureUf", CLIENT_PASSWORD = "p".repeat(24);
+    static final String SERVER_PASSWORD = "fixedTestPassword0000000000000000";
+    static String field(String sdp, String name) {
+        return sdp.lines().filter(x -> x.startsWith("a=" + name + ":")).findFirst().orElseThrow()
+            .substring(name.length() + 3).trim();
     }
-    record DeferredRequest(byte[] packet,String address,int port,long firstNanos) {}
-    // Generic RFC 5389 short-term credential check. No application authorization is encoded.
-    static DeferredRequest validate(byte[] packet,String address,int port,String expectedUser,String password) throws Exception {
-        if(packet.length<20 || packet.length>2048) return null;
-        ByteBuffer b=ByteBuffer.wrap(packet);
-        if(b.getShort(0)!=1 || b.getInt(4)!=0x2112a442 || Short.toUnsignedInt(b.getShort(2))+20!=packet.length) return null;
-        String username=null; int integrity=-1;
-        for(int i=20;i<packet.length;) {
-            if(i+4>packet.length) return null;
-            int type=Short.toUnsignedInt(b.getShort(i)), len=Short.toUnsignedInt(b.getShort(i+2));
-            if(i+4+len>packet.length) return null;
-            if(type==6) { if(username!=null || integrity!=-1) return null; username=new String(packet,i+4,len,StandardCharsets.US_ASCII); }
-            if(type==8) { if(integrity!=-1 || len!=20 || username==null) return null; integrity=i; }
-            i+=4+((len+3)&~3); if(i>packet.length) return null;
-        }
-        if(!expectedUser.equals(username) || integrity<0) return null;
-        byte[] signed=Arrays.copyOf(packet,integrity);
-        ByteBuffer.wrap(signed).putShort(2,(short)(integrity+24-20));
-        Mac mac=Mac.getInstance("HmacSHA1");
-        mac.init(new SecretKeySpec(password.getBytes(StandardCharsets.US_ASCII),"HmacSHA1"));
-        if(!MessageDigest.isEqual(mac.doFinal(signed),Arrays.copyOfRange(packet,integrity+4,integrity+24))) return null;
-        return new DeferredRequest(packet,address,port,System.nanoTime());
+    static void check(boolean ok, String message) { if (!ok) throw new AssertionError(message); }
+    static void await(java.util.function.BooleanSupplier condition, String message) throws Exception {
+        for (int i = 0; i < 400 && !condition.getAsBoolean(); i++) Thread.sleep(5);
+        check(condition.getAsBoolean(), message);
     }
-    static void check(boolean ok,String message) { if(!ok) throw new AssertionError(message); }
+    static PeerConnection client() {
+        return PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true).withBindAddress(LOOPBACK));
+    }
+    static IceUdpMuxListener.Acceptance settings(Path certificate, Path key, String offer,
+            java.util.function.Consumer<PeerConnection> initializer) {
+        return new IceUdpMuxListener.Acceptance(PeerConnectionConfiguration.DEFAULT, offer, SERVER_PASSWORD,
+            certificate, key, null, Runnable::run, initializer);
+    }
+    static String answer(String ufrag, String fingerprint) {
+        return "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n" +
+            "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=setup:active\r\n" +
+            "a=ice-ufrag:" + ufrag + "\r\na=ice-pwd:" + SERVER_PASSWORD + "\r\na=fingerprint:sha-256 " + fingerprint +
+            "\r\na=sctp-port:5000\r\na=max-message-size:262144\r\na=candidate:1 1 UDP 2130706431 127.0.0.1 " + PORT +
+            " typ host\r\na=end-of-candidates\r\n";
+    }
     public static void main(String[] args) throws Exception {
-        Path certificate=Path.of(args[0]), key=Path.of(args[1]);
+        Path certificate = Path.of(args[0]), key = Path.of(args[1]);
         byte[] der;
-        try(var input=Files.newInputStream(certificate)) { der=CertificateFactory.getInstance("X.509").generateCertificate(input).getEncoded(); }
-        String hostFingerprint=HexFormat.ofDelimiter(":").withUpperCase().formatHex(MessageDigest.getInstance("SHA-256").digest(der));
-        try(PeerConnection encrypted=PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true),
-            Runnable::run,certificate,Path.of(args[2]),"test-only-password")) {
-            encrypted.createDataChannel("encrypted-key");
-            encrypted.setLocalDescription(null,"encryptedIdentity","publicTestPassword0000000");
-            check(field(encrypted.localDescription(),"fingerprint").equals("sha-256 "+hostFingerprint),"encrypted key preserves certificate identity");
-            check(encrypted.closeAndAwait(java.time.Duration.ofSeconds(5)),"encrypted-key peer cleanup");
+        try (var input = Files.newInputStream(certificate)) {
+            der = CertificateFactory.getInstance("X.509").generateCertificate(input).getEncoded();
         }
-        System.out.println("native-transport PASS encryptedPemKey=true nullableDescriptionType=true");
-        for(int ufragLength:new int[]{167,178,256}) run(certificate,key,hostFingerprint,ufragLength,false);
-        run(certificate,key,hostFingerprint,167,true);
+        String fingerprint = HexFormat.ofDelimiter(":").withUpperCase().formatHex(MessageDigest.getInstance("SHA-256").digest(der));
+        try (PeerConnection encrypted = PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true),
+                Runnable::run, certificate, Path.of(args[2]), "test-only-password")) {
+            encrypted.createDataChannel("encrypted-key");
+            encrypted.setLocalDescription(null, "encryptedIdentity", "publicTestPassword0000000");
+            check(field(encrypted.localDescription(), "fingerprint").equals("sha-256 " + fingerprint), "encrypted key preserves identity");
+            check(encrypted.closeAndAwait(Duration.ofSeconds(5)), "encrypted-key peer cleanup");
+        }
+        firstRequest(certificate, key, false);
+        firstRequest(certificate, key, true);
+        cancelledRequests(certificate, key);
+        failedDecisions(certificate, key);
+        closeDuringInitialization(certificate, key);
+        for (int length : new int[] {167, 178, 256}) run(certificate, key, fingerprint, length, false);
+        run(certificate, key, fingerprint, 167, true);
     }
-    static void run(Path certificate,Path key,String hostFingerprint,int ufragLength,boolean wrongFingerprint) throws Exception {
-        ArrayBlockingQueue<DeferredRequest> work=new ArrayBlockingQueue<>(4);
-        String serverUfrag="s".repeat(ufragLength), serverPassword="fixedTestPassword0000000000000000";
-        Set<String> approved=ConcurrentHashMap.newKeySet(), claimed=ConcurrentHashMap.newKeySet();
-        AtomicInteger rejected=new AtomicInteger(),created=new AtomicInteger(),rawPackets=new AtomicInteger();
-        AtomicReference<Throwable> failure=new AtomicReference<>();
-        AtomicReference<byte[]> initialPacket=new AtomicReference<>();
-        AtomicInteger initialPort=new AtomicInteger();
-        List<PeerConnection> hosts=new ArrayList<>();
-        CountDownLatch messages=new CountDownLatch(2), opened=new CountDownLatch(2);
-        AtomicInteger channelMask=new AtomicInteger(), callbackCloseGuards=new AtomicInteger();
-        CountDownLatch hostFailed=new CountDownLatch(1);
-        try(RawUdpMuxListener mux=new RawUdpMuxListener(LOOPBACK,PORT,(packet,address,port)->{
-            rawPackets.incrementAndGet(); String tuple=address+":"+port;
-            if(approved.contains(tuple)) return true;
-            try {
-                DeferredRequest admission=validate(packet,address,port,serverUfrag+":clientFixtureUf",serverPassword);
-                if(admission==null) {rejected.incrementAndGet();return false;}
-                if(claimed.add(tuple)) {
-                    initialPacket.set(packet); initialPort.set(port);
-                    check(work.offer(admission),"bounded creation queue");
+
+    static byte[] binding(String localUfrag, String password) throws Exception {
+        byte[] username = (localUfrag + ":" + CLIENT_UFRAG).getBytes(StandardCharsets.US_ASCII);
+        ByteBuffer packet = ByteBuffer.allocate(2048);
+        packet.putShort((short) 1).putShort((short) 0).putInt(0x2112a442);
+        packet.putInt(0x12345678).putLong(0x0102030405060708L);
+        packet.putShort((short) 6).putShort((short) username.length).put(username);
+        while (packet.position() % 4 != 0) packet.put((byte) 0);
+        packet.putShort((short) 0x24).putShort((short) 4).putInt(2130706431);
+        packet.putShort((short) 0x802a).putShort((short) 8).putLong(0x7071727374757677L);
+        packet.putShort((short) 0x25).putShort((short) 0);
+        int integrity = packet.position();
+        packet.putShort(2, (short) (integrity + 24 - 20));
+        Mac mac = Mac.getInstance("HmacSHA1");
+        mac.init(new SecretKeySpec(password.getBytes(StandardCharsets.US_ASCII), "HmacSHA1"));
+        byte[] digest = mac.doFinal(Arrays.copyOf(packet.array(), integrity));
+        packet.putShort((short) 8).putShort((short) 20).put(digest);
+        return Arrays.copyOf(packet.array(), packet.position());
+    }
+
+    static void firstRequest(Path certificate, Path key, boolean forged) throws Exception {
+        String ufrag = "singleRequestServer";
+        CompletableFuture<IceUdpMuxListener.Acceptance> decision = new CompletableFuture<>();
+        ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(2);
+        AtomicInteger notifications = new AtomicInteger();
+        try (PeerConnection client = client();
+             IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, Runnable::run, request -> {
+                 notifications.incrementAndGet(); arrivals.add(request); return decision;
+             }); DatagramSocket sender = new DatagramSocket(new InetSocketAddress(LOOPBACK, 0))) {
+            client.createDataChannel("fixture");
+            client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+            long before = PeerConnection.nativeCreationAttempts();
+            byte[] packet = binding(ufrag, forged ? "wrongPassword0000000000000" : SERVER_PASSWORD);
+            sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT)); // Exactly one transmission.
+            IceUdpMuxListener.Request request = arrivals.poll(5, TimeUnit.SECONDS);
+            check(request != null, "initial request reaches asynchronous listener");
+            check(request.localUfrag().equals(ufrag) && request.remoteUfrag().equals(CLIENT_UFRAG), "parsed request metadata");
+            Thread.sleep(150);
+            check(PeerConnection.nativeCreationAttempts() == before && mux.stats()[2] == 0, "no peer before decision");
+            decision.complete(settings(certificate, key, client.localDescription(), peer -> {}));
+            if (forged) {
+                try { request.completion().toCompletableFuture().get(5, TimeUnit.SECONDS); throw new AssertionError("forged STUN accepted"); }
+                catch (ExecutionException expected) { /* Native integrity verification rejected it. */ }
+                check(PeerConnection.nativeCreationAttempts() == before && mux.stats()[2] == 0 && mux.stats()[3] == 0,
+                    "forged integrity creates no peer or mapping");
+                check(mux.failure() == null, "ordinary rejection keeps listener healthy");
+                System.out.println("native-transport PASS forgedIntegrity=no-peer");
+            } else {
+                PeerConnection host = request.completion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                try {
+                    sender.setSoTimeout(3000);
+                    boolean response = false;
+                    for (int i = 0; i < 20 && !response; i++) {
+                        DatagramPacket received = new DatagramPacket(new byte[2048], 2048);
+                        sender.receive(received);
+                        ByteBuffer data = ByteBuffer.wrap(received.getData(), 0, received.getLength());
+                        response = received.getLength() >= 20 && data.getShort(0) == 0x0101 &&
+                            data.getInt(8) == 0x12345678 && data.getLong(12) == 0x0102030405060708L;
+                    }
+                    check(response && notifications.get() == 1, "retained first request receives response without retransmission");
+                    System.out.println("native-transport PASS firstRequestSent=1 delayedAcceptance=true response=true");
+                } finally { check(host.closeAndAwait(Duration.ofSeconds(5)), "single-request cleanup"); }
+            }
+        }
+    }
+
+    static void cancelledRequests(Path certificate, Path key) throws Exception {
+        for (boolean close : new boolean[] {false, true}) {
+            CompletableFuture<IceUdpMuxListener.Acceptance> decision = new CompletableFuture<>();
+            ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(1);
+            try (PeerConnection client = client();
+                 IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, 1, Duration.ofMillis(200), Runnable::run,
+                     request -> { arrivals.add(request); return decision; });
+                 DatagramSocket sender = new DatagramSocket(new InetSocketAddress(LOOPBACK, 0))) {
+                client.createDataChannel("fixture"); client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+                long before = PeerConnection.nativeCreationAttempts();
+                byte[] packet = binding("cancelledServer", SERVER_PASSWORD);
+                sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+                IceUdpMuxListener.Request request = arrivals.poll(5, TimeUnit.SECONDS);
+                check(request != null, "pending cancellation fixture");
+                if (close) mux.close();
+                try { request.completion().toCompletableFuture().get(5, TimeUnit.SECONDS); throw new AssertionError("cancelled request accepted"); }
+                catch (ExecutionException | CancellationException expected) { }
+                decision.complete(settings(certificate, key, client.localDescription(), peer -> { throw new AssertionError("late initializer"); }));
+                Thread.sleep(50);
+                check(PeerConnection.nativeCreationAttempts() == before, "late decision cannot create a peer");
+            }
+        }
+        System.out.println("native-transport PASS timeoutAndClose=cancelled lateDecisions=no-peer");
+    }
+
+    static void failedDecisions(Path certificate, Path key) throws Exception {
+        for (String failureKind : new String[] {"handler", "initializer", "closedPeer", "configuration", "expired"}) {
+            ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(1);
+            AtomicReference<PeerConnection> initialized = new AtomicReference<>();
+            try (PeerConnection client = client()) {
+                client.createDataChannel("fixture"); client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+                String offer = client.localDescription();
+                if (failureKind.equals("configuration")) offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n" +
+                    "a=ice-ufrag:" + CLIENT_UFRAG + "\r\na=ice-pwd:" + CLIENT_PASSWORD + "\r\na=fingerprint:" +
+                    field(offer, "fingerprint") + "\r\na=setup:actpass\r\n"; // Credentials, but no media section.
+                final String remoteOffer = offer;
+                try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, Runnable::run, request -> {
+                    arrivals.add(request);
+                    if (failureKind.equals("handler")) throw new IllegalStateException("fixture handler failure");
+                    return CompletableFuture.completedFuture(new IceUdpMuxListener.Acceptance(
+                        PeerConnectionConfiguration.DEFAULT, remoteOffer, SERVER_PASSWORD, certificate, key, null,
+                        Runnable::run, peer -> {
+                            initialized.set(peer);
+                            if (failureKind.equals("closedPeer")) peer.close();
+                            throw new IllegalStateException("fixture initializer failure");
+                        },
+                        failureKind.equals("expired") ? java.time.Instant.EPOCH : java.time.Instant.MAX));
+                }); DatagramSocket sender = new DatagramSocket(new InetSocketAddress(LOOPBACK, 0))) {
+                    long before = PeerConnection.nativeCreationAttempts();
+                    byte[] packet = binding("failureFixtureServer", SERVER_PASSWORD);
+                    sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+                    IceUdpMuxListener.Request request = arrivals.poll(5, TimeUnit.SECONDS);
+                    check(request != null, "failure fixture metadata");
+                    try { request.completion().toCompletableFuture().get(10, TimeUnit.SECONDS); throw new AssertionError("failed decision accepted"); }
+                    catch (ExecutionException expected) { }
+                    boolean allocated = failureKind.equals("initializer") || failureKind.equals("closedPeer") || failureKind.equals("configuration");
+                    check(PeerConnection.nativeCreationAttempts() == before + (allocated ? 1 : 0), "creation ordering for " + failureKind);
+                    check(mux.stats()[2] == 0 && mux.stats()[3] == 0 && mux.stats()[4] == 0 && mux.failure() == null,
+                        "failed decision frees native resources and leaves listener healthy: " + failureKind);
+                    if (initialized.get() != null) check(initialized.get().closeAndAwait(Duration.ofMillis(1)), "binding cleanup was completed and is idempotent");
                 }
-            } catch(Exception error) {rejected.incrementAndGet();}
-            return false;
-        });PeerConnection client=PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true).withBindAddress(LOOPBACK))) {
-            long baselineNativeAttempts=PeerConnection.nativeCreationAttempts();
-            check(mux.stats()[2]==0,"host has zero agents before any client packet");
-            try(DatagramSocket invalid=new DatagramSocket()) {
-                byte[] noise=new byte[40];invalid.send(new DatagramPacket(noise,noise.length,LOOPBACK,PORT));
-                for(int i=0;i<100 && rejected.get()==0;i++) Thread.sleep(5);
-                check(rejected.get()>0 && mux.stats()[2]==0 && mux.stats()[3]==0,"invalid datagram created no native state");
             }
-            List<DataChannel> clientChannels=new ArrayList<>();
-            for(int channel=0;channel<2;channel++) {
-                String label=channel==0?"ordered":"unordered";
-                var init=DataChannelInitSettings.DEFAULT.withReliability(new DataChannelReliability(channel==1,channel==1,0,0));
-                var dc=client.createDataChannel(label,init);clientChannels.add(dc);
-                dc.onOpen.register(d->{
-                    try { client.closeAndAwait(java.time.Duration.ofMillis(1)); failure.set(new AssertionError("teardown wait must reject callback context")); }
-                    catch(IllegalStateException expected) { callbackCloseGuards.incrementAndGet(); }
-                    opened.countDown();ByteBuffer message=ByteBuffer.allocateDirect(2);message.put((byte)0).put((byte)(label.equals("ordered")?1:2)).flip();d.sendMessage(message);});
-            }
-            client.setLocalDescription("offer","clientFixtureUf","p".repeat(24));
-            // Model generic signalling that advertises a provisioned endpoint identity.
-            String answer="v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n"+
-                "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\nc=IN IP4 0.0.0.0\r\na=mid:0\r\na=setup:active\r\n"+
-                "a=ice-ufrag:"+serverUfrag+"\r\na=ice-pwd:"+serverPassword+"\r\na=fingerprint:sha-256 "+hostFingerprint+
-                "\r\na=sctp-port:5000\r\na=max-message-size:262144\r\na=candidate:1 1 UDP 2130706431 127.0.0.1 "+PORT+" typ host\r\na=end-of-candidates\r\n";
-            client.setRemoteDescription(answer,SessionDescriptionType.ANSWER);
-            DeferredRequest admitted=work.poll(10,TimeUnit.SECONDS);check(admitted!=null,"raw STUN reaches listener before a peer exists");
-            check(mux.stats()[2]==0 && PeerConnection.nativeCreationAttempts()==baselineNativeAttempts,"ingress validation precedes native peer construction");
-            PeerConnection host=PeerConnection.createPeer(PeerConnectionConfiguration.DEFAULT.withDisableAutoNegotiation(true).withBindAddress(LOOPBACK)
-                .withEnableIceUdpMux(true).withPortRangeBegin((short)PORT).withPortRangeEnd((short)PORT),Runnable::run,certificate,key);
-            hosts.add(host);created.incrementAndGet();
-            check(PeerConnection.nativeCreationAttempts()==baselineNativeAttempts+1,"exactly one native creation attempt");
-            check(System.nanoTime()>admitted.firstNanos(),"monotonic validation before creation");
-            host.onStateChange.register((p,state)->{if(state==PeerState.RTC_FAILED) hostFailed.countDown();});
-            host.onDataChannel.register((p,dc)->{
-                String label=dc.label();int bit=label.equals("ordered")?1:label.equals("unordered")?2:0;
-                if(bit==0){failure.set(new AssertionError("unexpected label"));return;}
-                channelMask.getAndUpdate(mask->mask|bit);
-                dc.onMessage.register(DataChannelCallback.Message.handleBinary((d,buffer)->{
-                    try {check(buffer.remaining()==2 && buffer.get()==0 && buffer.get()==bit,"channel identity and payload");messages.countDown();}
-                    catch(Throwable error){failure.set(error);}
+        }
+        AtomicInteger handlers = new AtomicInteger();
+        try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT,
+                task -> { throw new RejectedExecutionException("fixture full executor"); },
+                request -> { handlers.incrementAndGet(); return CompletableFuture.completedFuture(null); });
+             DatagramSocket sender = new DatagramSocket(new InetSocketAddress(LOOPBACK, 0))) {
+            long before = PeerConnection.nativeCreationAttempts();
+            byte[] packet = binding("rejectedExecutor", SERVER_PASSWORD);
+            sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+            await(() -> mux.stats()[5] == 1 && mux.stats()[4] == 0, "executor rejection removes pending request");
+            check(handlers.get() == 0 && PeerConnection.nativeCreationAttempts() == before && mux.failure() == null,
+                "executor overload rejects without invoking handler or poisoning listener");
+        }
+        System.out.println("native-transport PASS handlerFailure=true initializerFailure=cleaned closedInitializerPeer=cleaned configurationFailure=cleaned expiry=no-peer executorRejection=no-peer");
+    }
+
+    static void closeDuringInitialization(Path certificate, Path key) throws Exception {
+        AtomicReference<IceUdpMuxListener> listener = new AtomicReference<>();
+        AtomicReference<PeerConnection> prepared = new AtomicReference<>();
+        AtomicBoolean closeFinishedInsideInitializer = new AtomicBoolean();
+        ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(1);
+        try (PeerConnection client = client()) {
+            client.createDataChannel("fixture"); client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+            try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, Runnable::run, request -> {
+                arrivals.add(request);
+                return CompletableFuture.completedFuture(settings(certificate, key, client.localDescription(), peer -> {
+                    prepared.set(peer);
+                    try {
+                        CompletableFuture.runAsync(() -> listener.get().close()).get(3, TimeUnit.SECONDS);
+                        closeFinishedInsideInitializer.set(true);
+                    } catch (Exception error) { throw new CompletionException(error); }
                 }));
-            });
-            String remoteOffer=client.localDescription();
-            if(wrongFingerprint) {
-                String fingerprint=field(remoteOffer,"fingerprint");
-                char replacement=fingerprint.charAt(8)=='0'?'1':'0';
-                remoteOffer=remoteOffer.replace(fingerprint,fingerprint.substring(0,8)+replacement+fingerprint.substring(9));
+            }); DatagramSocket sender = new DatagramSocket(new InetSocketAddress(LOOPBACK, 0))) {
+                listener.set(mux);
+                byte[] packet = binding("closeDuringSetup", SERVER_PASSWORD);
+                sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+                IceUdpMuxListener.Request request = arrivals.poll(5, TimeUnit.SECONDS);
+                check(request != null, "concurrent-close fixture metadata");
+                try { request.completion().toCompletableFuture().get(8, TimeUnit.SECONDS); throw new AssertionError("closed listener accepted"); }
+                catch (ExecutionException expected) { }
+                check(closeFinishedInsideInitializer.get(), "initializer can wait for concurrent listener close without deadlocking");
+                check(prepared.get() != null && prepared.get().closeAndAwait(Duration.ofMillis(1)), "concurrent close cleans the prepared peer");
             }
-            host.setRemoteDescription(remoteOffer,SessionDescriptionType.OFFER);
-            host.setLocalDescription("answer",serverUfrag,serverPassword);
-            check(field(host.localDescription(),"fingerprint").equals("sha-256 "+hostFingerprint),"published native certificate identity");
-            check(field(host.localDescription(),"ice-ufrag").equals(serverUfrag),"native preserved explicit ICE username");
-            approved.add(admitted.address()+":"+admitted.port());
-            mux.replay(initialPacket.getAndSet(null),LOOPBACK,initialPort.get());
-            if(wrongFingerprint) {
-                check(hostFailed.await(15,TimeUnit.SECONDS),"DTLS rejects an incorrect remote fingerprint");
-                check(channelMask.get()==0 && opened.getCount()==2,"wrong certificate opens no channels");
+        }
+        System.out.println("native-transport PASS initializerConcurrentClose=no-deadlock preparedPeer=cleaned");
+    }
+
+    static void run(Path certificate, Path key, String fingerprint, int ufragLength, boolean wrongFingerprint) throws Exception {
+        String serverUfrag = "s".repeat(ufragLength);
+        CompletableFuture<IceUdpMuxListener.Acceptance> decision = new CompletableFuture<>();
+        ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(4);
+        AtomicInteger notifications = new AtomicInteger(), channelMask = new AtomicInteger(), callbackGuards = new AtomicInteger();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        CountDownLatch opened = new CountDownLatch(2), messages = new CountDownLatch(402), failed = new CountDownLatch(1);
+        PeerConnection host = null;
+        try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, Runnable::run, request -> {
+                notifications.incrementAndGet(); arrivals.add(request); return decision;
+             }); PeerConnection client = client()) {
+            long before = PeerConnection.nativeCreationAttempts();
+            try (DatagramSocket noise = new DatagramSocket()) {
+                byte[] garbage = new byte[40]; noise.send(new DatagramPacket(garbage, garbage.length, LOOPBACK, PORT));
+                await(() -> mux.stats()[0] > 0, "native receives garbage");
+                check(notifications.get() == 0 && mux.stats()[2] == 0 && mux.stats()[3] == 0, "garbage stays native and creates no state");
+            }
+            for (int channel = 0; channel < 2; channel++) {
+                String label = channel == 0 ? "ordered" : "unordered";
+                var init = DataChannelInitSettings.DEFAULT.withReliability(new DataChannelReliability(channel == 1, false, 0, 0));
+                DataChannel dc = client.createDataChannel(label, init);
+                dc.onOpen.register(d -> {
+                    try { client.closeAndAwait(Duration.ofMillis(1)); failure.set(new AssertionError("callback teardown wait allowed")); }
+                    catch (IllegalStateException expected) { callbackGuards.incrementAndGet(); }
+                    opened.countDown();
+                    for (int i = 0; i < 201; i++) {
+                        ByteBuffer message = ByteBuffer.allocateDirect(2);
+                        message.put((byte) 0).put((byte) (label.equals("ordered") ? 1 : 2)).flip(); d.sendMessage(message);
+                    }
+                });
+            }
+            client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+            client.setRemoteDescription(answer(serverUfrag, fingerprint), SessionDescriptionType.ANSWER);
+            IceUdpMuxListener.Request request = arrivals.poll(10, TimeUnit.SECONDS);
+            check(request != null, "STUN arrives before host peer exists");
+            Thread.sleep(1100); // Force normal ICE retransmissions while application approval remains pending.
+            check(notifications.get() == 1 && mux.stats()[6] > 0 && mux.stats()[2] == 0 &&
+                PeerConnection.nativeCreationAttempts() == before, "duplicates coalesce before native peer creation");
+            String offer = client.localDescription();
+            if (wrongFingerprint) {
+                String old = field(offer, "fingerprint"); char replacement = old.charAt(8) == '0' ? '1' : '0';
+                offer = offer.replace(old, old.substring(0, 8) + replacement + old.substring(9));
+            }
+            decision.complete(settings(certificate, key, offer, peer -> {
+                check(field(peer.localDescription(), "fingerprint").equals("sha-256 " + fingerprint), "published certificate identity");
+                check(field(peer.localDescription(), "ice-ufrag").equals(serverUfrag), "explicit ICE username preserved");
+                peer.onStateChange.register((p, state) -> { if (state == PeerState.RTC_FAILED) failed.countDown(); });
+                peer.onDataChannel.register((p, dc) -> {
+                    int bit = dc.label().equals("ordered") ? 1 : dc.label().equals("unordered") ? 2 : 0;
+                    channelMask.getAndUpdate(mask -> mask | bit);
+                    dc.onMessage.register(DataChannelCallback.Message.handleBinary((d, data) -> {
+                        try { check(bit != 0 && data.remaining() == 2 && data.get() == 0 && data.get() == bit, "distinct channel payload"); messages.countDown(); }
+                        catch (Throwable error) { failure.set(error); }
+                    }));
+                });
+            }));
+            host = request.completion().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            if (wrongFingerprint) {
+                check(failed.await(15, TimeUnit.SECONDS), "DTLS rejects incorrect client fingerprint");
+                check(opened.getCount() == 2 && channelMask.get() == 0, "wrong certificate opens no channels");
                 System.out.println("native-transport PASS wrongRemoteFingerprint=dtls-rejected channels=0");
-                for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");hosts.clear();
-                return;
+            } else {
+                check(opened.await(10, TimeUnit.SECONDS) && messages.await(10, TimeUnit.SECONDS), "both channels deliver 402 messages");
+                check(failure.get() == null && callbackGuards.get() == 2 && channelMask.get() == 3, "callback and data-channel checks");
+                long[] stats = mux.stats();
+                check(notifications.get() == 1 && stats[5] == 1 && stats[2] == 1 && stats[3] == 1 && stats[0] > 10,
+                    "transport traffic stays native after one admission callback");
+                System.out.println("native-transport PASS ufragChars=" + ufragLength + " admissionCallbacks=1 duplicates=" + stats[6] +
+                    " datagrams=" + stats[0] + " channels=2 messages=402");
             }
-            check(opened.await(10,TimeUnit.SECONDS),"both client channels open");
-            check(messages.await(10,TimeUnit.SECONDS),"both channels deliver distinct binary messages");
-            check(failure.get()==null && callbackCloseGuards.get()==2,"native callbacks completed without failure and cannot wait on themselves");
-            check(created.get()==1 && work.isEmpty() && channelMask.get()==3,"one lazy peer and both channels");
-            long[] stats=mux.stats();check(stats[2]==1 && stats[3]==1,"one fixed-port agent and tuple");
-            System.out.println("native-transport PASS ufragChars="+ufragLength+" hostPeers="+created.get()+" rawPackets="+rawPackets.get()+" channels=2");
-            for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");hosts.clear();
-        } finally {for(PeerConnection peer:hosts) check(peer.closeAndAwait(java.time.Duration.ofSeconds(5)),"native teardown completes before releasing capacity");}
+        } finally { if (host != null) check(host.closeAndAwait(Duration.ofSeconds(5)), "accepted peer native cleanup"); }
     }
 }

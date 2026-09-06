@@ -5,15 +5,41 @@ import org.slf4j.LoggerFactory;
 import tel.schich.jniaccess.JNIAccess;
 
 import java.lang.ref.Cleaner;
+import java.util.Objects;
 
 public abstract class LibDataChannel {
     static final Cleaner CLEANER = Cleaner.create();
     private static final Logger LOGGER = LoggerFactory.getLogger(LibDataChannel.class);
     private static volatile boolean initialized = false;
+    // Read by JNI_OnLoad before rtcPreload can emit transport logs.
+    private static int nativeLogLevel = LogLevel.WARNING.value;
+
+    /** Native filtering happens before a message crosses into Java. */
+    public enum LogLevel {
+        NONE(0), FATAL(1), ERROR(2), WARNING(3), INFO(4), DEBUG(5), VERBOSE(6);
+
+        final int value;
+        LogLevel(int value) { this.value = value; }
+    }
 
     public static final String LIB_NAME = "datachannel-java";
 
     private LibDataChannel() {}
+
+    /** Sets the process-wide native log threshold, before or after initialization. */
+    public static synchronized void setLogLevel(LogLevel level) {
+        nativeLogLevel = Objects.requireNonNull(level, "level").value;
+        if (initialized) setLogLevelNative(nativeLogLevel);
+    }
+
+    public static synchronized LogLevel logLevel() {
+        return LogLevel.values()[nativeLogLevel];
+    }
+
+    @JNIAccess
+    private static int initialNativeLogLevel() { return nativeLogLevel; }
+
+    private static native void setLogLevelNative(int level);
 
     /**
      * Initializes the library by loading the native library.

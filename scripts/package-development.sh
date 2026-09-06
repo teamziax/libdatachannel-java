@@ -46,7 +46,7 @@ provenance = {
     'libjuiceRevision': head('jni/libdatachannel/deps/libjuice'),
     'platform': 'linux-x86_64',
     'nativeBuild': 'system OpenSSL, Debug, current host ABI; not a portable release',
-    'checks': ['nativeTransportProbe', 'nativeCallbackCleanupProbe', 'test'],
+    'checks': ['nativeTransportProbe', 'nativeCallbackCleanupProbe', 'nativeLoggingProbe', 'test'],
     'sha256': {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(root.iterdir()) if path.is_file()},
 }
 (root / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')
