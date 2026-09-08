@@ -10,9 +10,10 @@ set(NO_WEBSOCKET ON CACHE BOOL "configure libdatachannel build")
 set(NO_MEDIA ON CACHE BOOL "configure libdatachannel build")
 set(NO_TESTS ON CACHE BOOL "configure libdatachannel build")
 set(NO_EXAMPLES ON CACHE BOOL "configure libdatachannel build")
-add_subdirectory(libdatachannel)
+set(LIBDATACHANNEL_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libdatachannel" CACHE PATH "libdatachannel source checkout")
+add_subdirectory(${LIBDATACHANNEL_SOURCE_DIR} libdatachannel)
 
-include_directories(libdatachannel/include generated)
+include_directories(${LIBDATACHANNEL_SOURCE_DIR}/include generated)
 include_directories(jdk)
 if(WIN32)
     include_directories(jdk/windows)
@@ -54,6 +55,10 @@ add_library(datachannel-java SHARED
         src/util.c
         src/native_channel.c
         src/native_peer.c
+        src/native_mux.c
         src/native_track.c
         src/callback.c)
 target_link_libraries(datachannel-java PRIVATE datachannel-static)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(datachannel-java PRIVATE -Wl,--no-undefined)
+endif()

@@ -104,17 +104,18 @@ public class DataChannel implements Closeable {
      */
     @Override
     public void close() {
-        if (rtcClose(channelHandle) != ERR_INVALID) {
-            rtcDeleteDataChannel(channelHandle);
-        }
-
-        peer.dropChannelState(channelHandle);
+        // Listener shutdown unregisters native callbacks, so the handle must still exist.
         onOpen.close();
         onClosed.close();
         onError.close();
         onMessage.close();
         onBufferedAmountLow.close();
         onAvailable.close();
+
+        if (rtcClose(channelHandle) != ERR_INVALID) {
+            rtcDeleteDataChannel(channelHandle);
+        }
+        peer.dropChannelState(channelHandle);
     }
 
     /**

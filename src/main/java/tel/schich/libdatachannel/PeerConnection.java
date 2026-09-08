@@ -1,6 +1,10 @@
 package tel.schich.libdatachannel;
 
 import org.eclipse.jdt.annotation.Nullable;
+import tel.schich.jniaccess.JNIAccess;
+import java.nio.file.Path;
+import static tel.schich.libdatachannel.LibDataChannelNative.rtcCreatePeerConnectionWithIdentity;
+import static tel.schich.libdatachannel.LibDataChannelNative.rtcSetLocalDescriptionWithIce;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +49,11 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class PeerConnection implements Closeable {
     private static final Logger LOGGER = LoggerFactory.getLogger(PeerConnection.class);
@@ -54,6 +63,10 @@ public class PeerConnection implements Closeable {
     private final ConcurrentMap<Integer, DataChannel> channels;
     private final ConcurrentMap<Integer, Track> tracks;
     private final Cleaner.Cleanable cleanable;
+    private volatile boolean nativeTeardownComplete;
+    private @Nullable CompletableFuture<Void> closeCompletion;
+    private final Object preparationLock = new Object();
+    private boolean preparationOwned, preparationCloseRequested;
     final PeerConnectionListener listener;
 
     public final EventListenerContainer<PeerConnectionCallback.LocalDescription> onLocalDescription;
@@ -89,7 +102,29 @@ public class PeerConnection implements Closeable {
         });
     }
 
-    private static String @Nullable [] iceUrisToStrings(@Nullable Collection<URI> uris) {
+    static PeerConnection fromNative(int handle, Executor executor) {
+        PeerConnection peer = new PeerConnection(handle, executor);
+        peer.preparationOwned = true;
+        return peer;
+    }
+
+    boolean preparationCloseRequested() {
+        synchronized (preparationLock) { return preparationCloseRequested; }
+    }
+
+    boolean releasePreparation() {
+        synchronized (preparationLock) {
+            if (preparationCloseRequested && !nativeTeardownComplete) return false;
+            preparationOwned = false;
+            return !preparationCloseRequested;
+        }
+    }
+
+    void installNativeListener() {
+        wrapError("setupPeerConnectionListener", setupPeerConnectionListener(peerHandle, listener));
+    }
+
+    static String @Nullable [] iceUrisToStrings(@Nullable Collection<URI> uris) {
         if (uris == null || uris.isEmpty()) {
             return null;
         }
@@ -111,15 +146,35 @@ public class PeerConnection implements Closeable {
      * @return the peer connection
      */
     public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor) {
+        return createPeer(config, executor, null, null);
+    }
+
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor, DtlsIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        return createPeer(config, executor, identity.certificate(), identity.privateKey(), identity.password());
+    }
+
+    /** Creates a peer using a paired PEM DTLS certificate/key, or the default identity if both null. */
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
+                                           @Nullable Path certificate, @Nullable Path key) {
+        return createPeer(config, executor, certificate, key, null);
+    }
+
+    /** Imports an endpoint identity using the upstream native certificate configuration. */
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
+                                           @Nullable Path certificate, @Nullable Path key,
+                                           @Nullable String keyPassword) {
+        if ((certificate == null) != (key == null)) throw new IllegalArgumentException("Certificate/key must be paired");
+        if (keyPassword != null && key == null) throw new IllegalArgumentException("A key password requires an identity");
         String proxyServer = null;
         if (config.proxyServer != null) {
             proxyServer = config.proxyServer.toASCIIString();
         }
         String bindAddress = null;
         if (config.bindAddress != null) {
-            bindAddress = config.bindAddress.toString();
+            bindAddress = config.bindAddress.getHostAddress();
         }
-        int result = rtcCreatePeerConnection(
+        int result = rtcCreatePeerConnectionWithIdentity(
                 iceUrisToStrings(config.iceServers),
                 proxyServer,
                 bindAddress,
@@ -132,13 +187,18 @@ public class PeerConnection implements Closeable {
                 config.portRangeBegin,
                 config.portRangeEnd,
                 config.mtu,
-                config.maxMessageSize);
+                config.maxMessageSize,
+                certificate == null ? null : certificate.toString(),
+                key == null ? null : key.toString(), keyPassword);
 
         final PeerConnection peer = new PeerConnection(wrapError("rtcCreatePeerConnection", result), executor);
         setupPeerConnectionListener(peer.peerHandle, peer.listener);
 
         return peer;
     }
+
+    /** Diagnostic count at native peer construction, including failed attempts. */
+    static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
 
     public static PeerConnection createPeer(PeerConnectionConfiguration config) {
         return createPeer(config, Runnable::run);
@@ -177,7 +237,7 @@ public class PeerConnection implements Closeable {
         } catch (Exception e) {
             LOGGER.warn("Failed to close channels of peer connection", e);
         }
-        cleanable.clean();
+        // Detach callbacks before the cleaner deletes their native peer handle.
         onLocalDescription.close();
         onLocalCandidate.close();
         onStateChange.close();
@@ -186,7 +246,67 @@ public class PeerConnection implements Closeable {
         onSignalingStateChange.close();
         onDataChannel.close();
         onTrack.close();
+        boolean deferDeletion;
+        synchronized (preparationLock) {
+            deferDeletion = preparationOwned;
+            if (deferDeletion) preparationCloseRequested = true;
+        }
+        if (deferDeletion) rtcClosePeerConnection(peerHandle);
+        else cleanable.clean();
     }
+
+    /**
+     * Force-close and await native transport teardown before deleting the peer.
+     * Call only from an external owner thread, never a native callback. A timeout
+     * returns false and retains ownership so the caller can retry or fail closed.
+     */
+    public boolean closeAndAwait(java.time.Duration timeout) {
+        if (EventListenerContainer.inCallback()) throw new IllegalStateException("Cannot await teardown from a native event callback");
+        long millis = timeout.toMillis();
+        if (millis < 1 || millis > 30_000) throw new IllegalArgumentException("Teardown timeout must be 1..30000 ms");
+        try {
+            closeAsync().toCompletableFuture().get(millis, TimeUnit.MILLISECONDS);
+            return true;
+        } catch (TimeoutException timeoutError) {
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException error) {
+            throw new IllegalStateException("Native close failed", error.getCause());
+        }
+    }
+
+    /**
+     * Starts native closure without blocking a worker on teardown. Safe from event
+     * callbacks. Completion follows transport destruction and Java handle cleanup.
+     * A peer still being initialized remains owned by its incoming-request handler.
+     */
+    public synchronized CompletionStage<Void> closeAsync() {
+        if (closeCompletion == null) {
+            closeCompletion = new CompletableFuture<>();
+            int result = closeAsyncNative(peerHandle, this);
+            if (result != 0) closeCompletion.completeExceptionally(
+                new IllegalStateException("Cannot initiate native close: " + result));
+        }
+        return closeCompletion.minimalCompletionStage();
+    }
+
+    @JNIAccess
+    private void nativeCloseCompleted() {
+        nativeTeardownComplete = true;
+        // Neither handle cleanup nor arbitrary user continuations run inside JNI completion.
+        CompletableFuture.runAsync(() -> {
+            CompletableFuture<Void> completion;
+            synchronized (this) { completion = closeCompletion; }
+            try {
+                close();
+                completion.complete(null);
+            } catch (Throwable error) { completion.completeExceptionally(error); }
+        });
+    }
+
+    private static native int closeAsyncNative(int peerHandle, PeerConnection owner);
 
     /**
      * Closes all Data Channels.
@@ -211,6 +331,12 @@ public class PeerConnection implements Closeable {
      *
      * @param type (optional): type of the description ("offer", "answer", "pranswer", or "rollback") or NULL for autodetection.
      */
+    /** Installs the exact local ICE credentials before gathering starts. */
+    public void setLocalDescription(@Nullable String type, String ufrag, String password) {
+        if (ufrag.isEmpty() || password.isEmpty()) throw new IllegalArgumentException("ICE credentials required");
+        wrapError("rtcSetLocalDescriptionWithIce", rtcSetLocalDescriptionWithIce(peerHandle, type, ufrag, password));
+    }
+
     public void setLocalDescription(String type) {
         wrapError("rtcSetLocalDescription", rtcSetLocalDescription(peerHandle, type));
     }
