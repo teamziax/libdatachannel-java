@@ -455,7 +455,8 @@ val configureNativeProbe by tasks.registering(Exec::class) {
     commandLine("cmake", "-S", "jni", "-B", "build/native-probe", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
         "-DLIBDATACHANNEL_SOURCE_DIR=${project.file("jni/libdatachannel").absolutePath}", "-DUSE_SYSTEM_JUICE=OFF",
         "-DCMAKE_BUILD_TYPE=Debug", "-DPROJECT_VERSION=${project.version}", "-DENABLE_LOCALHOST_ADDRESS=ON",
-        "-DTRANSPORT_TEARDOWN_TESTS=ON", "-DPENDING_MUX_TESTS=ON", "-DICE_UDP_MUX_TESTS=ON")
+        "-DTRANSPORT_TEARDOWN_TESTS=ON", "-DPENDING_MUX_TESTS=ON", "-DICE_UDP_MUX_TESTS=ON",
+        "-DRTC_ENABLE_TEST_DIAGNOSTICS=ON")
 }
 val compileNativeProbe by tasks.registering(Exec::class) {
     dependsOn(configureNativeProbe)

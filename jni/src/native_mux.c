@@ -77,6 +77,11 @@ JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_rejectNa
     return rtcRejectIceUdpMuxRequest(listener, (uint64_t)requestId);
 }
 
+JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_attachNative(
+    JNIEnv *env, jclass clazz, jint listener, jlong requestId, jint peer) {
+    return rtcAttachIceUdpMuxPeer(listener, (uint64_t)requestId, peer);
+}
+
 JNIEXPORT jlongArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_statsNative(
     JNIEnv *env, jclass clazz, jint listener) {
     rtcIceUdpMuxListenerStats stats;

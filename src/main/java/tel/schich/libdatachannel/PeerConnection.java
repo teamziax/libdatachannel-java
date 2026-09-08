@@ -1,6 +1,7 @@
 package tel.schich.libdatachannel;
 
 import org.eclipse.jdt.annotation.Nullable;
+import tel.schich.jniaccess.JNIAccess;
 import java.nio.file.Path;
 import static tel.schich.libdatachannel.LibDataChannelNative.rtcCreatePeerConnectionWithIdentity;
 import static tel.schich.libdatachannel.LibDataChannelNative.rtcSetLocalDescriptionWithIce;
@@ -48,6 +49,11 @@ import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 public class PeerConnection implements Closeable {
     private static final Logger LOGGER = LoggerFactory.getLogger(PeerConnection.class);
@@ -58,6 +64,7 @@ public class PeerConnection implements Closeable {
     private final ConcurrentMap<Integer, Track> tracks;
     private final Cleaner.Cleanable cleanable;
     private volatile boolean nativeTeardownComplete;
+    private @Nullable CompletableFuture<Void> closeCompletion;
     private final Object preparationLock = new Object();
     private boolean preparationOwned, preparationCloseRequested;
     final PeerConnectionListener listener;
@@ -142,6 +149,11 @@ public class PeerConnection implements Closeable {
         return createPeer(config, executor, null, null);
     }
 
+    public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor, DtlsIdentity identity) {
+        Objects.requireNonNull(identity, "identity");
+        return createPeer(config, executor, identity.certificate(), identity.privateKey(), identity.password());
+    }
+
     /** Creates a peer using a paired PEM DTLS certificate/key, or the default identity if both null. */
     public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
                                            @Nullable Path certificate, @Nullable Path key) {
@@ -186,7 +198,7 @@ public class PeerConnection implements Closeable {
     }
 
     /** Diagnostic count at native peer construction, including failed attempts. */
-    public static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
+    static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
 
     public static PeerConnection createPeer(PeerConnectionConfiguration config) {
         return createPeer(config, Runnable::run);
@@ -252,16 +264,49 @@ public class PeerConnection implements Closeable {
         if (EventListenerContainer.inCallback()) throw new IllegalStateException("Cannot await teardown from a native event callback");
         long millis = timeout.toMillis();
         if (millis < 1 || millis > 30_000) throw new IllegalArgumentException("Teardown timeout must be 1..30000 ms");
-        synchronized (this) {
-            if (nativeTeardownComplete) return true;
-            int result = LibDataChannelNative.rtcClosePeerConnectionAndWait(peerHandle, (int)millis);
-            if (result == -3) return false; // RTC_ERR_NOT_AVAIL
-            if (result != 0) throw new IllegalStateException("Native close failed: " + result);
-            nativeTeardownComplete = true;
-            close();
+        try {
+            closeAsync().toCompletableFuture().get(millis, TimeUnit.MILLISECONDS);
             return true;
+        } catch (TimeoutException timeoutError) {
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (ExecutionException error) {
+            throw new IllegalStateException("Native close failed", error.getCause());
         }
     }
+
+    /**
+     * Starts native closure without blocking a worker on teardown. Safe from event
+     * callbacks. Completion follows transport destruction and Java handle cleanup.
+     * A peer still being initialized remains owned by its incoming-request handler.
+     */
+    public synchronized CompletionStage<Void> closeAsync() {
+        if (closeCompletion == null) {
+            closeCompletion = new CompletableFuture<>();
+            int result = closeAsyncNative(peerHandle, this);
+            if (result != 0) closeCompletion.completeExceptionally(
+                new IllegalStateException("Cannot initiate native close: " + result));
+        }
+        return closeCompletion.minimalCompletionStage();
+    }
+
+    @JNIAccess
+    private void nativeCloseCompleted() {
+        nativeTeardownComplete = true;
+        // Neither handle cleanup nor arbitrary user continuations run inside JNI completion.
+        CompletableFuture.runAsync(() -> {
+            CompletableFuture<Void> completion;
+            synchronized (this) { completion = closeCompletion; }
+            try {
+                close();
+                completion.complete(null);
+            } catch (Throwable error) { completion.completeExceptionally(error); }
+        });
+    }
+
+    private static native int closeAsyncNative(int peerHandle, PeerConnection owner);
 
     /**
      * Closes all Data Channels.

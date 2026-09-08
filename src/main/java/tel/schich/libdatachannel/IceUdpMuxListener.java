@@ -32,6 +32,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
         private final int remotePort;
         private final CompletableFuture<PeerConnection> completion = new CompletableFuture<>();
         private final AtomicBoolean settling = new AtomicBoolean();
+        private final AtomicReference<Throwable> cancellation = new AtomicReference<>();
         private volatile ScheduledFuture<?> timeout;
 
         private Request(long id, String localUfrag, String remoteUfrag, String remoteAddress, int remotePort) {
@@ -61,7 +62,10 @@ public final class IceUdpMuxListener implements AutoCloseable {
         final Executor peerExecutor;
         final Consumer<PeerConnection> initializer;
         final Instant expiresAt;
+        final @Nullable PeerConnection existingPeer;
 
+        /** @deprecated Use {@link #builder(String, String)}. */
+        @Deprecated
         public Acceptance(PeerConnectionConfiguration configuration, String remoteDescription, String localPassword,
                           @Nullable Path certificate, @Nullable Path key, @Nullable String keyPassword,
                           Executor peerExecutor, Consumer<PeerConnection> initializer) {
@@ -69,6 +73,8 @@ public final class IceUdpMuxListener implements AutoCloseable {
                 peerExecutor, initializer, Instant.MAX);
         }
 
+        /** @deprecated Use {@link #builder(String, String)}. */
+        @Deprecated
         public Acceptance(PeerConnectionConfiguration configuration, String remoteDescription, String localPassword,
                           @Nullable Path certificate, @Nullable Path key, @Nullable String keyPassword,
                           Executor peerExecutor, Consumer<PeerConnection> initializer, Instant expiresAt) {
@@ -83,7 +89,67 @@ public final class IceUdpMuxListener implements AutoCloseable {
             this.peerExecutor = Objects.requireNonNull(peerExecutor, "peerExecutor");
             this.initializer = Objects.requireNonNull(initializer, "initializer");
             this.expiresAt = Objects.requireNonNull(expiresAt, "expiresAt");
+            this.existingPeer = null;
         }
+
+        private Acceptance(PeerConnection peer, Instant expiresAt) {
+            this.configuration = PeerConnectionConfiguration.DEFAULT;
+            this.remoteDescription = this.localPassword = "";
+            this.certificate = this.key = null;
+            this.keyPassword = null;
+            this.peerExecutor = Runnable::run;
+            this.initializer = ignored -> {};
+            this.expiresAt = Objects.requireNonNull(expiresAt, "expiresAt");
+            this.existingPeer = Objects.requireNonNull(peer, "peer");
+        }
+
+        /** Approve another tuple for a caller-owned peer without replacing its identity or channels. */
+        public static Acceptance reuse(PeerConnection peer) { return reuse(peer, Instant.MAX); }
+        public static Acceptance reuse(PeerConnection peer, Instant expiresAt) { return new Acceptance(peer, expiresAt); }
+
+        public static Builder builder(String remoteDescription, String localPassword) {
+            return new Builder(remoteDescription, localPassword);
+        }
+
+        public static final class Builder {
+            private final String remoteDescription, localPassword;
+            private PeerConnectionConfiguration configuration = PeerConnectionConfiguration.DEFAULT;
+            private @Nullable DtlsIdentity identity;
+            private Executor peerExecutor = Runnable::run;
+            private Consumer<PeerConnection> initializer = ignored -> {};
+            private Instant expiresAt = Instant.MAX;
+
+            private Builder(String remoteDescription, String localPassword) {
+                this.remoteDescription = Objects.requireNonNull(remoteDescription, "remoteDescription");
+                this.localPassword = Objects.requireNonNull(localPassword, "localPassword");
+            }
+            public Builder configuration(PeerConnectionConfiguration value) { configuration = Objects.requireNonNull(value); return this; }
+            public Builder identity(DtlsIdentity value) { identity = Objects.requireNonNull(value); return this; }
+            public Builder peerExecutor(Executor value) { peerExecutor = Objects.requireNonNull(value); return this; }
+            public Builder initialize(Consumer<PeerConnection> value) { initializer = Objects.requireNonNull(value); return this; }
+            public Builder expiresAt(Instant value) { expiresAt = Objects.requireNonNull(value); return this; }
+            public Acceptance build() {
+                return new Acceptance(configuration, remoteDescription, localPassword,
+                    identity == null ? null : identity.certificate(), identity == null ? null : identity.privateKey(),
+                    identity == null ? null : identity.password(), peerExecutor, initializer, expiresAt);
+            }
+        }
+    }
+
+    /** Snapshot of native listener activity. Counts belong to this endpoint. */
+    public static final class Statistics {
+        private final long received, rejected, agents, mappedTuples, pendingRequests, notifications, duplicates;
+        private Statistics(long[] values) {
+            received = values[0]; rejected = values[1]; agents = values[2]; mappedTuples = values[3];
+            pendingRequests = values[4]; notifications = values[5]; duplicates = values[6];
+        }
+        public long received() { return received; }
+        public long rejected() { return rejected; }
+        public long agents() { return agents; }
+        public long mappedTuples() { return mappedTuples; }
+        public long pendingRequests() { return pendingRequests; }
+        public long notifications() { return notifications; }
+        public long duplicates() { return duplicates; }
     }
 
     private static final ScheduledThreadPoolExecutor DEADLINES = new ScheduledThreadPoolExecutor(1, task -> {
@@ -153,29 +219,33 @@ public final class IceUdpMuxListener implements AutoCloseable {
         Request request = new Request(id, localUfrag, remoteUfrag, address, port);
         if (requests.putIfAbsent(id, request) != null) return true;
         try {
-            request.timeout = DEADLINES.schedule(() -> execute(request,
-                () -> finish(request, null, new TimeoutException("Incoming ICE request expired"))), requestTimeoutMillis, TimeUnit.MILLISECONDS);
+            request.timeout = DEADLINES.schedule(() -> cancel(request,
+                new TimeoutException("Incoming ICE request expired")), requestTimeoutMillis, TimeUnit.MILLISECONDS);
             dispatchQueue.execute(() -> execute(request, () -> decide(request)));
             return true;
         } catch (Throwable error) {
             requests.remove(id, request);
             if (request.timeout != null) request.timeout.cancel(false);
-            request.completion.completeExceptionally(error);
+            complete(request, null, error);
             return false;
         }
     }
 
     private void execute(Request request, Runnable task) {
         try { executor.execute(task); }
-        catch (Throwable error) { finish(request, null, error); }
+        catch (Throwable error) { cancel(request, error); }
     }
 
     private void decide(Request request) {
         if (!requests.containsKey(request.id)) return;
         try {
             CompletionStage<Acceptance> decision = Objects.requireNonNull(handler.onRequest(request), "decision stage");
-            decision.whenComplete((settings, error) -> execute(request, () -> finish(request, settings, error)));
-        } catch (Throwable error) { finish(request, null, error); }
+            decision.whenComplete((settings, error) -> {
+                if (error != null || settings == null)
+                    cancel(request, error != null ? error : new CancellationException("Incoming ICE request rejected"));
+                else execute(request, () -> finish(request, settings, null));
+            });
+        } catch (Throwable error) { cancel(request, error); }
     }
 
     private synchronized int openListenerId() {
@@ -183,16 +253,49 @@ public final class IceUdpMuxListener implements AutoCloseable {
         return listenerId;
     }
 
-    private void finish(Request request, @Nullable Acceptance settings, @Nullable Throwable error) {
+    private static void complete(Request request, @Nullable PeerConnection peer, @Nullable Throwable error) {
+        // Removing the slot is synchronous. Application continuations use a separate
+        // completion worker and cannot block the deadline or JNI dispatch thread.
+        CompletableFuture.runAsync(() -> {
+            if (error == null) request.completion.complete(peer);
+            else request.completion.completeExceptionally(error);
+        });
+    }
+
+    private void cancel(Request request, Throwable cause) {
+        request.cancellation.compareAndSet(null, cause);
         if (!request.settling.compareAndSet(false, true)) return;
         if (request.timeout != null) request.timeout.cancel(false);
+        int id;
+        synchronized (this) { id = handle == 0 ? -1 : listenerId; }
+        if (id >= 0) rejectNative(id, request.id);
+        requests.remove(request.id, request);
+        complete(request, null, cause);
+    }
+
+    private static void checkCancellation(Request request) {
+        Throwable cause = request.cancellation.get();
+        if (cause != null) throw new CompletionException(cause);
+    }
+
+    private void finish(Request request, @Nullable Acceptance settings, @Nullable Throwable error) {
+        if (!request.settling.compareAndSet(false, true)) return;
         PeerConnection peer = null;
         int preparedHandle = -1;
         try {
             int id = openListenerId();
+            checkCancellation(request);
             if (error != null) throw new CompletionException(error);
             if (settings == null) throw new CancellationException("Incoming ICE request rejected");
             if (!Instant.now().isBefore(settings.expiresAt)) throw new TimeoutException("Admission settings expired");
+            if (settings.existingPeer != null) {
+                int result = attachNative(id, request.id, settings.existingPeer.peerHandle);
+                if (result != 0) throw new IllegalStateException("Cannot attach incoming ICE tuple: " + result);
+                if (request.timeout != null) request.timeout.cancel(false);
+                requests.remove(request.id, request);
+                complete(request, settings.existingPeer, null);
+                return;
+            }
             int[] prepared = prepareNative(id, request.id, settings.configuration, settings.remoteDescription,
                 request.localUfrag, settings.localPassword,
                 settings.certificate == null ? null : settings.certificate.toString(),
@@ -205,13 +308,15 @@ public final class IceUdpMuxListener implements AutoCloseable {
             // Application code may close this listener or the peer. Never hold a listener lock here.
             settings.initializer.accept(peer);
             id = openListenerId();
+            checkCancellation(request);
             if (!Instant.now().isBefore(settings.expiresAt)) throw new TimeoutException("Admission settings expired");
             if (peer.preparationCloseRequested()) throw new CancellationException("Incoming peer closed during setup");
             int result = acceptNative(id, request.id, peer.peerHandle);
             if (result != 0) throw new IllegalStateException("Cannot accept incoming ICE peer: " + result);
             if (!peer.releasePreparation()) throw new CancellationException("Incoming peer closed during acceptance");
+            if (request.timeout != null) request.timeout.cancel(false);
             requests.remove(request.id, request);
-            request.completion.complete(peer);
+            complete(request, peer, null);
             return;
         } catch (Throwable cause) {
             error = cause;
@@ -219,38 +324,50 @@ public final class IceUdpMuxListener implements AutoCloseable {
             synchronized (this) { id = handle == 0 ? -1 : listenerId; }
             if (id >= 0) rejectNative(id, request.id);
         }
+        if (request.timeout != null) request.timeout.cancel(false);
         if (preparedHandle < 0) {
             requests.remove(request.id, request);
-            request.completion.completeExceptionally(error);
+            complete(request, null, error);
         } else cleanup(preparedHandle, peer, request, error);
     }
 
     private void cleanup(int preparedHandle, @Nullable PeerConnection peer, Request request, Throwable error) {
+        if (peer != null) {
+            peer.closeAsync().whenComplete((ignored, closeError) -> {
+                if (closeError != null) { failure.set(closeError); return; }
+                try {
+                    peer.releasePreparation();
+                    peer.close();
+                    requests.remove(request.id, request);
+                    complete(request, null, error);
+                } catch (Throwable failureCause) { failure.set(failureCause); }
+            });
+            return;
+        }
+        // No wrapper could be constructed. Keep the raw handle until teardown succeeds.
         CLEANUP.execute(() -> {
             try {
-                boolean closed = peer != null ? peer.closeAndAwait(Duration.ofSeconds(5)) :
-                    LibDataChannelNative.rtcClosePeerConnectionAndWait(preparedHandle, 5000) == 0;
-                if (closed) {
-                    if (peer != null) {
-                        peer.releasePreparation();
-                        peer.close();
-                    } else LibDataChannelNative.rtcDeletePeerConnection(preparedHandle);
+                if (LibDataChannelNative.rtcClosePeerConnectionAndWait(preparedHandle, 5000) == 0) {
+                    LibDataChannelNative.rtcDeletePeerConnection(preparedHandle);
                     requests.remove(request.id, request);
-                    request.completion.completeExceptionally(error);
+                    complete(request, null, error);
                     return;
                 }
-            } catch (Throwable closeError) {
-                failure.set(closeError);
-            }
-            // The pending slot and peer stay owned until native teardown is confirmed.
-            CLEANUP.schedule(() -> cleanup(preparedHandle, peer, request, error), 100, TimeUnit.MILLISECONDS);
+            } catch (Throwable closeError) { failure.set(closeError); }
+            CLEANUP.schedule(() -> cleanup(preparedHandle, null, request, error), 100, TimeUnit.MILLISECONDS);
         });
     }
 
     /** An admission infrastructure failure, for diagnostics. */
     public @Nullable Throwable failure() { return failure.get(); }
 
-    /** received, rejected, agents, mapped tuples, pending requests, notifications, duplicates. */
+    public synchronized Statistics statistics() {
+        if (handle == 0) throw new IllegalStateException("ICE listener closed");
+        return new Statistics(statsNative(listenerId));
+    }
+
+    /** @deprecated Use {@link #statistics()} for named counters. */
+    @Deprecated
     public synchronized long[] stats() {
         if (handle == 0) throw new IllegalStateException("ICE listener closed");
         return statsNative(listenerId);
@@ -260,15 +377,17 @@ public final class IceUdpMuxListener implements AutoCloseable {
     public void close() {
         synchronized (this) {
             if (handle == 0) return;
-            closeNative(handle);
+            long closing = handle;
             handle = 0;
+            try { closeNative(closing); }
+            catch (Throwable error) { handle = closing; throw error; }
         }
         // A direct executor may be running user code on this thread. Closing the
         // listener cancels its request; it must not interrupt that application code.
         dispatchQueue.getQueue().clear();
         dispatchQueue.shutdown();
-        for (Request request : requests.values()) execute(request,
-            () -> finish(request, null, new CancellationException("ICE listener closed")));
+        for (Request request : requests.values())
+            cancel(request, new CancellationException("ICE listener closed"));
     }
 
     private native long openNative(String address, int port, int maxPendingRequests, int requestTimeoutMillis);
@@ -291,6 +410,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
         int mtu, int maxMessageSize, @Nullable String certificate, @Nullable String key, @Nullable String keyPassword,
         String remoteDescription, String localUfrag, String localPassword);
     private static native int acceptNative(int handle, long requestId, int peer);
+    private static native int attachNative(int handle, long requestId, int peer);
     private static native int rejectNative(int handle, long requestId);
     private static native long[] statsNative(int handle);
     private static native int listenerIdNative(long handle);

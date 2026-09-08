@@ -52,10 +52,13 @@ public C API.
 var listener = new IceUdpMuxListener(bindAddress, port, executor, request -> {
     var settings = validate(request.localUfrag(), request.remoteUfrag());
     request.completion().whenComplete((peer, error) -> recordOutcome(peer, error));
-    return CompletableFuture.completedFuture(new IceUdpMuxListener.Acceptance(
-        configuration, settings.remoteOffer(), settings.localPassword(),
-        certificatePath, keyPath, null, executor,
-        peer -> installCallbacks(peer), settings.expiresAt()));
+    return CompletableFuture.completedFuture(IceUdpMuxListener.Acceptance
+        .builder(settings.remoteOffer(), settings.localPassword())
+        .configuration(configuration)
+        .identity(new DtlsIdentity(certificatePath, keyPath))
+        .peerExecutor(executor)
+        .initialize(peer -> installCallbacks(peer))
+        .expiresAt(settings.expiresAt()).build());
 });
 ```
 
@@ -73,10 +76,29 @@ A failed prepared peer remains owned until native teardown completes; only then
 does the request's completion stage fail. `failure()` reports an unexpected
 cleanup failure, without treating ordinary admission rejection as listener failure.
 
-`stats()` reports received datagrams, rejections, native ICE agents, mapped
-addresses, pending requests, admission notifications and suppressed duplicates,
-in that order. `closeAndAwait(Duration)` returns false on timeout without releasing
-ownership. Once it confirms teardown, repeated calls return true.
+`statistics()` returns immutable named counters for received datagrams, rejections,
+ICE agents, mapped tuples, pending requests, notifications and duplicates. The old
+positional `stats()` adapter and `Acceptance` constructors are deprecated and retained
+for existing consumers.
+
+`PeerConnection.closeAsync()` returns a `CompletionStage<Void>` after native transport
+destruction and Java cleanup. It is safe from event callbacks and uses native completion
+notification rather than blocking a Java worker on each closing peer. The blocking
+`closeAndAwait(Duration)` convenience returns false on timeout without releasing
+ownership. Repeated calls return true after cleanup completes.
+
+Unprepared deadline/close cancellation releases the Java admission slot independently
+of the application executor. Completion continuations run on the common completion
+pool, so user code cannot block the deadline or JNI callback thread. An initializer
+already running cannot be forcibly stopped: its prepared peer remains owned until
+initialization returns and cleanup completes. Cancellation is checked before final
+acceptance; native expiry also prevents stale attachment.
+
+Return `Acceptance.reuse(existingPeer)` to approve another source tuple for a peer.
+Native code checks the existing ICE credentials and retains its SDP, DTLS identity,
+channels and caller ownership, including on failed attachment. Use the optional
+expiry argument when the application approval has its own deadline. Applications
+remain responsible for deciding whether an address change is allowed.
 
 The certificate overload uses upstream `rtcConfiguration` PEM fields; explicit
 ICE credentials use upstream `rtcSetLocalDescriptionEx`. Key provisioning and
@@ -96,3 +118,11 @@ together after changing the pinned native version.
 For local CMake experiments, `LIBDATACHANNEL_SOURCE_DIR` can select a separate
 libdatachannel checkout. The Gradle probe and packaging tasks explicitly select
 the pinned submodule and bundled libjuice again.
+
+Construction-attempt diagnostics are package-private test instrumentation and require
+`RTC_ENABLE_TEST_DIAGNOSTICS=ON` in the native build. Ordinary builds omit the counter.
+The probe suite additionally covers stalled application executors, same-peer tuple
+attachment, forged attachment, reentrant listener close, scoped C++ preparation and
+asynchronous destruction completion.
+
+Detailed [contributor and source attribution](../docs/contribution-provenance.md) is retained separately.

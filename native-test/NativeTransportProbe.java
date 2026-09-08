@@ -33,8 +33,8 @@ public final class NativeTransportProbe {
     }
     static IceUdpMuxListener.Acceptance settings(Path certificate, Path key, String offer,
             java.util.function.Consumer<PeerConnection> initializer) {
-        return new IceUdpMuxListener.Acceptance(PeerConnectionConfiguration.DEFAULT, offer, SERVER_PASSWORD,
-            certificate, key, null, Runnable::run, initializer);
+        return IceUdpMuxListener.Acceptance.builder(offer, SERVER_PASSWORD)
+            .identity(new DtlsIdentity(certificate, key)).initialize(initializer).build();
     }
     static String answer(String ufrag, String fingerprint) {
         return "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n" +
@@ -60,6 +60,8 @@ public final class NativeTransportProbe {
         firstRequest(certificate, key, false);
         firstRequest(certificate, key, true);
         cancelledRequests(certificate, key);
+        stalledExecutorCancellation();
+        reusedPeer(certificate, key);
         failedDecisions(certificate, key);
         closeDuringInitialization(certificate, key);
         for (int length : new int[] {167, 178, 256}) run(certificate, key, fingerprint, length, false);
@@ -103,12 +105,12 @@ public final class NativeTransportProbe {
             check(request != null, "initial request reaches asynchronous listener");
             check(request.localUfrag().equals(ufrag) && request.remoteUfrag().equals(CLIENT_UFRAG), "parsed request metadata");
             Thread.sleep(150);
-            check(PeerConnection.nativeCreationAttempts() == before && mux.stats()[2] == 0, "no peer before decision");
+            check(PeerConnection.nativeCreationAttempts() == before && mux.statistics().agents() == 0, "no peer before decision");
             decision.complete(settings(certificate, key, client.localDescription(), peer -> {}));
             if (forged) {
                 try { request.completion().toCompletableFuture().get(5, TimeUnit.SECONDS); throw new AssertionError("forged STUN accepted"); }
                 catch (ExecutionException expected) { /* Native integrity verification rejected it. */ }
-                check(PeerConnection.nativeCreationAttempts() == before && mux.stats()[2] == 0 && mux.stats()[3] == 0,
+                check(PeerConnection.nativeCreationAttempts() == before && mux.statistics().agents() == 0 && mux.statistics().mappedTuples() == 0,
                     "forged integrity creates no peer or mapping");
                 check(mux.failure() == null, "ordinary rejection keeps listener healthy");
                 System.out.println("native-transport PASS forgedIntegrity=no-peer");
@@ -156,6 +158,78 @@ public final class NativeTransportProbe {
         System.out.println("native-transport PASS timeoutAndClose=cancelled lateDecisions=no-peer");
     }
 
+    static void stalledExecutorCancellation() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        CountDownLatch blocked = new CountDownLatch(1), release = new CountDownLatch(1);
+        ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(1);
+        AtomicInteger handlers = new AtomicInteger();
+        try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, 1, Duration.ofMillis(300), executor,
+                request -> { handlers.incrementAndGet(); arrivals.add(request); return new CompletableFuture<>(); });
+             DatagramSocket sender = new DatagramSocket()) {
+            byte[] packet = binding("executorDeadline", SERVER_PASSWORD);
+            sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+            var request = arrivals.poll(3, TimeUnit.SECONDS);
+            check(request != null, "executor fixture receives first request");
+            executor.execute(() -> {
+                blocked.countDown();
+                try { release.await(); } catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+            });
+            check(blocked.await(3, TimeUnit.SECONDS), "application executor stalled");
+            try { request.completion().toCompletableFuture().get(3, TimeUnit.SECONDS); throw new AssertionError("timeout accepted"); }
+            catch (ExecutionException expected) { }
+            check(mux.statistics().pendingRequests() == 0, "native timeout finished independently");
+            byte[] second = binding("secondExecutorDeadline", SERVER_PASSWORD);
+            sender.send(new DatagramPacket(second, second.length, LOOPBACK, PORT));
+            await(() -> mux.statistics().notifications() == 2, "second notification reaches Java");
+            check(mux.statistics().pendingRequests() == 1, "Java timeout freed its admission slot before executor resumed");
+            mux.close();
+            release.countDown();
+            executor.shutdown();
+            check(executor.awaitTermination(3, TimeUnit.SECONDS), "executor drains cancelled work");
+            check(handlers.get() == 1, "late queued handler cannot revive a closed request");
+        } finally { release.countDown(); executor.shutdownNow(); }
+        System.out.println("native-transport PASS stalledExecutorTimeout=settled pendingSlot=reusable");
+    }
+
+    static void reusedPeer(Path certificate, Path key) throws Exception {
+        AtomicReference<PeerConnection> accepted = new AtomicReference<>();
+        ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(4);
+        try (PeerConnection client = client()) {
+            client.createDataChannel("fixture"); client.setLocalDescription("offer", CLIENT_UFRAG, CLIENT_PASSWORD);
+            try (IceUdpMuxListener mux = new IceUdpMuxListener(LOOPBACK, PORT, Runnable::run, request -> {
+                arrivals.add(request);
+                return CompletableFuture.completedFuture(accepted.get() == null ?
+                    settings(certificate, key, client.localDescription(), peer -> {}) : IceUdpMuxListener.Acceptance.reuse(accepted.get()));
+            }); DatagramSocket first = new DatagramSocket(); DatagramSocket second = new DatagramSocket(); DatagramSocket forged = new DatagramSocket()) {
+                byte[] packet = binding("reuseExistingPeer", SERVER_PASSWORD);
+                first.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+                var request = arrivals.poll(3, TimeUnit.SECONDS); check(request != null, "new peer notification");
+                var peer = request.completion().toCompletableFuture().get(3, TimeUnit.SECONDS);
+                accepted.set(peer);
+                try {
+                    await(() -> mux.statistics().mappedTuples() == 1, "first tuple attached");
+                    long constructions = PeerConnection.nativeCreationAttempts();
+                    second.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
+                    var additional = arrivals.poll(3, TimeUnit.SECONDS); check(additional != null, "additional tuple notification");
+                    check(additional.completion().toCompletableFuture().get(3, TimeUnit.SECONDS) == peer, "reuse returns the same Java wrapper");
+                    await(() -> mux.statistics().mappedTuples() == 2, "second authenticated tuple attached");
+                    check(mux.statistics().agents() == 1 && PeerConnection.nativeCreationAttempts() == constructions,
+                        "additional tuple does not allocate a peer");
+                    byte[] invalid = binding("reuseExistingPeer", "incorrectPassword000000000");
+                    forged.send(new DatagramPacket(invalid, invalid.length, LOOPBACK, PORT));
+                    var bad = arrivals.poll(3, TimeUnit.SECONDS); check(bad != null, "forged tuple notification");
+                    try { bad.completion().toCompletableFuture().get(3, TimeUnit.SECONDS); throw new AssertionError("forged reuse accepted"); }
+                    catch (ExecutionException expected) { }
+                    check(mux.statistics().agents() == 1 && mux.statistics().mappedTuples() == 2,
+                        "rejected tuple leaves caller-owned peer alive");
+                    peer.closeAsync().toCompletableFuture().get(5, TimeUnit.SECONDS);
+                    check(mux.statistics().agents() == 0, "asynchronous close confirms resource destruction");
+                } finally { peer.closeAndAwait(Duration.ofSeconds(5)); }
+            }
+        }
+        System.out.println("native-transport PASS existingPeerReuse=authenticated forgedReuse=preservesPeer asyncClose=complete");
+    }
+
     static void failedDecisions(Path certificate, Path key) throws Exception {
         for (String failureKind : new String[] {"handler", "initializer", "closedPeer", "configuration", "expired"}) {
             ArrayBlockingQueue<IceUdpMuxListener.Request> arrivals = new ArrayBlockingQueue<>(1);
@@ -188,7 +262,7 @@ public final class NativeTransportProbe {
                     catch (ExecutionException expected) { }
                     boolean allocated = failureKind.equals("initializer") || failureKind.equals("closedPeer") || failureKind.equals("configuration");
                     check(PeerConnection.nativeCreationAttempts() == before + (allocated ? 1 : 0), "creation ordering for " + failureKind);
-                    check(mux.stats()[2] == 0 && mux.stats()[3] == 0 && mux.stats()[4] == 0 && mux.failure() == null,
+                    check(mux.statistics().agents() == 0 && mux.statistics().mappedTuples() == 0 && mux.statistics().pendingRequests() == 0 && mux.failure() == null,
                         "failed decision frees native resources and leaves listener healthy: " + failureKind);
                     if (initialized.get() != null) check(initialized.get().closeAndAwait(Duration.ofMillis(1)), "binding cleanup was completed and is idempotent");
                 }
@@ -202,7 +276,7 @@ public final class NativeTransportProbe {
             long before = PeerConnection.nativeCreationAttempts();
             byte[] packet = binding("rejectedExecutor", SERVER_PASSWORD);
             sender.send(new DatagramPacket(packet, packet.length, LOOPBACK, PORT));
-            await(() -> mux.stats()[5] == 1 && mux.stats()[4] == 0, "executor rejection removes pending request");
+            await(() -> mux.statistics().notifications() == 1 && mux.statistics().pendingRequests() == 0, "executor rejection removes pending request");
             check(handlers.get() == 0 && PeerConnection.nativeCreationAttempts() == before && mux.failure() == null,
                 "executor overload rejects without invoking handler or poisoning listener");
         }
@@ -220,6 +294,9 @@ public final class NativeTransportProbe {
                 arrivals.add(request);
                 return CompletableFuture.completedFuture(settings(certificate, key, client.localDescription(), peer -> {
                     prepared.set(peer);
+                    peer.onStateChange.register((p, state) -> {
+                        if (state == PeerState.RTC_CLOSED) listener.get().close();
+                    });
                     try {
                         CompletableFuture.runAsync(() -> listener.get().close()).get(3, TimeUnit.SECONDS);
                         closeFinishedInsideInitializer.set(true);
@@ -254,8 +331,8 @@ public final class NativeTransportProbe {
             long before = PeerConnection.nativeCreationAttempts();
             try (DatagramSocket noise = new DatagramSocket()) {
                 byte[] garbage = new byte[40]; noise.send(new DatagramPacket(garbage, garbage.length, LOOPBACK, PORT));
-                await(() -> mux.stats()[0] > 0, "native receives garbage");
-                check(notifications.get() == 0 && mux.stats()[2] == 0 && mux.stats()[3] == 0, "garbage stays native and creates no state");
+                await(() -> mux.statistics().received() > 0, "native receives garbage");
+                check(notifications.get() == 0 && mux.statistics().agents() == 0 && mux.statistics().mappedTuples() == 0, "garbage stays native and creates no state");
             }
             for (int channel = 0; channel < 2; channel++) {
                 String label = channel == 0 ? "ordered" : "unordered";
@@ -276,7 +353,7 @@ public final class NativeTransportProbe {
             IceUdpMuxListener.Request request = arrivals.poll(10, TimeUnit.SECONDS);
             check(request != null, "STUN arrives before host peer exists");
             Thread.sleep(1100); // Force normal ICE retransmissions while application approval remains pending.
-            check(notifications.get() == 1 && mux.stats()[6] > 0 && mux.stats()[2] == 0 &&
+            check(notifications.get() == 1 && mux.statistics().duplicates() > 0 && mux.statistics().agents() == 0 &&
                 PeerConnection.nativeCreationAttempts() == before, "duplicates coalesce before native peer creation");
             String offer = client.localDescription();
             if (wrongFingerprint) {
