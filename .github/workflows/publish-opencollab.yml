@@ -4,6 +4,11 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified artifacts to OpenCollab (TeamZiax uses a source-qualified snapshot)
+        type: boolean
+        default: false
 
 concurrency:
   group: publish-opencollab
@@ -17,8 +22,76 @@ env:
   TARGETS: x86_64,aarch64,windows-x86_64,macos-arm64,macos-x86_64
 
 jobs:
+  prepare:
+    name: Validate publication source and version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.source.outputs.version }}
+      publish: ${{ steps.source.outputs.publish }}
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        ref: ${{ github.sha }}
+        fetch-tags: 'true'
+        fetch-depth: '0'
+        submodules: recursive
+    - uses: actions/setup-java@v5
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+    - uses: gradle/actions/setup-gradle@v5
+    - name: Validate source and select version
+      id: source
+      env:
+        PUBLISH_ARTIFACTS: ${{ github.event_name == 'push' || inputs.publish }}
+      run: |
+        set -euo pipefail
+        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        git diff --exit-code
+        git submodule status --recursive > /tmp/submodule-status
+        if grep -E '^[+U-]' /tmp/submodule-status; then
+          echo 'Source submodules must match the committed revisions' >&2
+          exit 1
+        fi
+        case "$GITHUB_REPOSITORY" in
+          teamziax/libdatachannel-java)
+            test "$GITHUB_EVENT_NAME" = workflow_dispatch
+            test "$GITHUB_REF" = refs/heads/zulu/connectivity-diagnostic-host
+            native_version=$(sed -n 's/^#define RTC_VERSION "\([0-9.]*\)"/\1/p' jni/libdatachannel/include/rtc/version.h)
+            [[ "$native_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            version="$native_version.0-teamziax-connectivity-${GITHUB_SHA:0:12}-SNAPSHOT"
+            ;;
+          opencollab-incubator/libdatachannel-java)
+            version=$(./gradlew --quiet currentVersion)
+            ;;
+          *) echo 'Unsupported publishing repository' >&2; exit 1 ;;
+        esac
+        [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "publish=$PUBLISH_ARTIFACTS" >> "$GITHUB_OUTPUT"
+        {
+          echo "Version: $version"
+          echo "JNI: $GITHUB_SHA"
+          echo "libdatachannel: $(git rev-parse HEAD:jni/libdatachannel)"
+          echo "libjuice: $(git -C jni/libdatachannel rev-parse HEAD:deps/libjuice)"
+          echo "Publish: $PUBLISH_ARTIFACTS"
+        } | tee -a "$GITHUB_STEP_SUMMARY"
+    - name: Check publishing credential availability
+      env:
+        PUBLISH_ARTIFACTS: ${{ steps.source.outputs.publish }}
+        OPENCOLLAB_USERNAME: ${{ secrets.OPENCOLLAB_USERNAME }}
+        OPENCOLLAB_PASSWORD: ${{ secrets.OPENCOLLAB_PASSWORD }}
+      run: |
+        if [ -z "$OPENCOLLAB_USERNAME" ] || [ -z "$OPENCOLLAB_PASSWORD" ]; then
+          echo 'Publishing credentials unavailable: configure OPENCOLLAB_USERNAME and OPENCOLLAB_PASSWORD as repository or accessible organization secrets.' | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$PUBLISH_ARTIFACTS" != true
+        else
+          echo 'Publishing credential pair is configured.' >> "$GITHUB_STEP_SUMMARY"
+        fi
+
   build-macos:
     name: Build macOS Native Libraries
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -31,6 +104,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v6
       with:
+        ref: ${{ github.sha }}
         fetch-tags: 'true'
         fetch-depth: '0'
         submodules: recursive
@@ -57,7 +131,10 @@ jobs:
       uses: gradle/actions/setup-gradle@v5
 
     - name: Build native library for host
-      run: ./gradlew compileNativeForHost -Plibdatachannel.build-release-binaries=true
+      run: |
+        ./gradlew compileNativeForHost :test \
+          -Plibdatachannel.build-release-binaries=true \
+          -Plibdatachannel.development-version="${{ needs.prepare.outputs.version }}"
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v6
@@ -70,6 +147,7 @@ jobs:
 
   build-cross:
     name: Cross Compile Native Libraries
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -86,6 +164,7 @@ jobs:
     steps:
     - uses: actions/checkout@v6
       with:
+        ref: ${{ github.sha }}
         fetch-tags: 'true'
         fetch-depth: '0'
         submodules: recursive
@@ -103,6 +182,7 @@ jobs:
     - name: Build native library
       run: |
         ./gradlew ${{ matrix.task }} \
+          -Plibdatachannel.development-version="${{ needs.prepare.outputs.version }}" \
           -Plibdatachannel.build-release-binaries=true \
           -Plibdatachannel.targets=${{ matrix.classifier }}
 
@@ -115,12 +195,13 @@ jobs:
         if-no-files-found: error
 
   publish:
-    name: Publish to OpenCollab
-    needs: [ build-macos, build-cross ]
+    name: Verify artifacts and optionally publish
+    needs: [ prepare, build-macos, build-cross ]
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
       with:
+        ref: ${{ github.sha }}
         fetch-tags: 'true'
         fetch-depth: '0'
         submodules: recursive
@@ -141,9 +222,79 @@ jobs:
         pattern: libdatachannel-*
         path: artifacts
 
+    - name: Package and test the exact release binaries
+      env:
+        PUBLICATION_VERSION: ${{ needs.prepare.outputs.version }}
+      run: |
+        set -euo pipefail
+        native_args=(
+          "-Plibdatachannel.development-version=$PUBLICATION_VERSION"
+          "-Plibdatachannel.targets=$TARGETS"
+          -Plibdatachannel.x86_64.prebuilt-path=artifacts/libdatachannel-x86_64/libdatachannel-java.so
+          -Plibdatachannel.aarch64.prebuilt-path=artifacts/libdatachannel-aarch64/libdatachannel-java.so
+          -Plibdatachannel.windows-x86_64.prebuilt-path=artifacts/libdatachannel-windows-x86_64/libdatachannel-java.dll
+          -Plibdatachannel.macos-arm64.prebuilt-path=artifacts/libdatachannel-macos-arm64/libdatachannel-java.dylib
+          -Plibdatachannel.macos-x86_64.prebuilt-path=artifacts/libdatachannel-macos-x86_64/libdatachannel-java.dylib
+        )
+        # Reuse the focused-test classpath seam, without compiling a different Debug library.
+        ./gradlew --no-configuration-cache :assemble :libdatachannel-java-arch-detect:assemble \
+          :generatePomFileForMavenPublication :libdatachannel-java-arch-detect:generatePomFileForMavenPublication \
+          :test -x compileNativeProbe \
+          "-Plibdatachannel.test-native-path=$PWD/artifacts/libdatachannel-x86_64/libdatachannel-java.so" \
+          "${native_args[@]}"
+        python3 - <<'PY'
+        import json, os, pathlib, subprocess, xml.etree.ElementTree as ET, zipfile
+        version = os.environ['PUBLICATION_VERSION']
+        revision = os.environ['GITHUB_SHA']
+        def git(*args):
+            return subprocess.check_output(['git', *args], text=True).strip()
+        sources = {
+            'Source-Revision': revision,
+            'LibDataChannel-Revision': git('rev-parse', 'HEAD:jni/libdatachannel'),
+            'LibJuice-Revision': git('-C', 'jni/libdatachannel', 'rev-parse', 'HEAD:deps/libjuice'),
+        }
+        api = pathlib.Path(f'build/libs/libdatachannel-java-{version}.jar')
+        with zipfile.ZipFile(api) as jar:
+            manifest = jar.read('META-INF/MANIFEST.MF').decode().replace('\r\n ', '').splitlines()
+            attrs = dict(line.split(': ', 1) for line in manifest if ': ' in line)
+            assert attrs['Implementation-Version'] == version
+            assert all(attrs[key] == value for key, value in sources.items())
+        for classifier in os.environ['TARGETS'].split(','):
+            suffix = '.dll' if classifier.startswith('windows-') else '.dylib' if classifier.startswith('macos-') else '.so'
+            binary = f'libdatachannel-java{suffix}'
+            original = pathlib.Path(f'artifacts/libdatachannel-{classifier}/{binary}').read_bytes()
+            with zipfile.ZipFile(f'build/libs/libdatachannel-java-{version}-{classifier}.jar') as jar:
+                assert jar.read(f'native/{binary}') == original
+            with zipfile.ZipFile(f'arch-detect/build/libs/libdatachannel-java-arch-detect-{version}.jar') as jar:
+                assert jar.read(f'{classifier}/native/{binary}') == original
+        for pom in ('build/publications/maven/pom-default.xml', 'arch-detect/build/publications/maven/pom-default.xml'):
+            root = ET.parse(pom).getroot()
+            assert root.find('{*}groupId').text == 'dev.opencollab'
+            assert root.find('{*}version').text == version
+            for dependency in root.findall('.//{*}dependency'):
+                if dependency.find('{*}groupId').text == 'dev.opencollab':
+                    assert dependency.find('{*}version').text == version
+        pathlib.Path('build/publication-source.json').write_text(json.dumps({'version': version, **sources}, indent=2) + '\n')
+        PY
+        sha256sum build/libs/*.jar arch-detect/build/libs/*.jar > build/publication-sha256.txt
+    - name: Upload verified Maven artifacts
+      uses: actions/upload-artifact@v6
+      with:
+        name: maven-artifacts-${{ github.sha }}
+        path: |
+          build/libs/*.jar
+          arch-detect/build/libs/*.jar
+          build/publications/maven/pom-default.xml
+          arch-detect/build/publications/maven/pom-default.xml
+          build/publication-source.json
+          build/publication-sha256.txt
+          build/test-results/
+        if-no-files-found: error
     - name: Publish
+      if: needs.prepare.outputs.publish == 'true'
       run: |
         ./gradlew --no-configuration-cache openCollabDeploy \
+          -Plibdatachannel.development-version="${{ needs.prepare.outputs.version }}" \
           -Plibdatachannel.targets="$TARGETS" \
           -Plibdatachannel.x86_64.prebuilt-path=artifacts/libdatachannel-x86_64/libdatachannel-java.so \
           -Plibdatachannel.aarch64.prebuilt-path=artifacts/libdatachannel-aarch64/libdatachannel-java.so \
