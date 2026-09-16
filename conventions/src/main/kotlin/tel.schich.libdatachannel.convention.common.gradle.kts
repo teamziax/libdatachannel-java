@@ -51,6 +51,15 @@ dependencies {
 
 publishing {
     repositories {
+        // Temporary fork snapshots use the workflow's repository-scoped token.
+        // Canonical OpenCollab publishing remains unchanged.
+        if (System.getenv("GITHUB_REPOSITORY") == "teamziax/libdatachannel-java") {
+            maven {
+                name = "githubPackages"
+                url = uri("https://maven.pkg.github.com/teamziax/libdatachannel-java")
+                credentials(PasswordCredentials::class)
+            }
+        }
         maven {
             name = Constants.SNAPSHOTS_REPO
             url = uri("https://repo.opencollab.dev/maven-snapshots/")
@@ -94,6 +103,16 @@ publishing {
                     developerConnection.set("scm:git:git@github.com:opencollab-incubator/libdatachannel-java")
                 }
             }
+        }
+    }
+}
+
+// A restored fork must never overwrite the canonical artifact coordinates.
+tasks.withType<PublishToMavenRepository>().configureEach {
+    doFirst {
+        if (repository.name == "githubPackages" &&
+            !project.version.toString().matches(Regex("""[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+-teamziax-connectivity-[a-f0-9]{12}-SNAPSHOT"""))) {
+            throw GradleException("GitHub publication requires a source-qualified TeamZiax snapshot version")
         }
     }
 }

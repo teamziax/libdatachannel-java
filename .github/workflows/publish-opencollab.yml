@@ -1,4 +1,4 @@
-name: Publish to OpenCollab
+name: Publish Maven packages
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the verified artifacts to OpenCollab (TeamZiax uses a source-qualified snapshot)
+        description: Publish verified artifacts (TeamZiax GitHub snapshot or canonical OpenCollab)
         type: boolean
         default: false
 
@@ -76,7 +76,8 @@ jobs:
           echo "libjuice: $(git -C jni/libdatachannel rev-parse HEAD:deps/libjuice)"
           echo "Publish: $PUBLISH_ARTIFACTS"
         } | tee -a "$GITHUB_STEP_SUMMARY"
-    - name: Check publishing credential availability
+    - name: Check OpenCollab publishing credential availability
+      if: github.repository == 'opencollab-incubator/libdatachannel-java'
       env:
         PUBLISH_ARTIFACTS: ${{ steps.source.outputs.publish }}
         OPENCOLLAB_USERNAME: ${{ secrets.OPENCOLLAB_USERNAME }}
@@ -196,6 +197,9 @@ jobs:
 
   publish:
     name: Verify artifacts and optionally publish
+    permissions:
+      contents: read
+      packages: write
     needs: [ prepare, build-macos, build-cross ]
     runs-on: ubuntu-latest
     steps:
@@ -293,7 +297,13 @@ jobs:
     - name: Publish
       if: needs.prepare.outputs.publish == 'true'
       run: |
-        ./gradlew --no-configuration-cache openCollabDeploy \
+        set -euo pipefail
+        if [ "$GITHUB_REPOSITORY" = teamziax/libdatachannel-java ]; then
+          publish_tasks=(:publishMavenPublicationToGithubPackagesRepository :libdatachannel-java-arch-detect:publishMavenPublicationToGithubPackagesRepository)
+        else
+          publish_tasks=(openCollabDeploy)
+        fi
+        ./gradlew --no-configuration-cache "${publish_tasks[@]}" \
           -Plibdatachannel.development-version="${{ needs.prepare.outputs.version }}" \
           -Plibdatachannel.targets="$TARGETS" \
           -Plibdatachannel.x86_64.prebuilt-path=artifacts/libdatachannel-x86_64/libdatachannel-java.so \
@@ -302,6 +312,8 @@ jobs:
           -Plibdatachannel.macos-arm64.prebuilt-path=artifacts/libdatachannel-macos-arm64/libdatachannel-java.dylib \
           -Plibdatachannel.macos-x86_64.prebuilt-path=artifacts/libdatachannel-macos-x86_64/libdatachannel-java.dylib
       env:
+        ORG_GRADLE_PROJECT_githubPackagesUsername: ${{ github.actor }}
+        ORG_GRADLE_PROJECT_githubPackagesPassword: ${{ github.token }}
         ORG_GRADLE_PROJECT_openCollabSnapshotsUsername: ${{ secrets.OPENCOLLAB_USERNAME }}
         ORG_GRADLE_PROJECT_openCollabSnapshotsPassword: ${{ secrets.OPENCOLLAB_PASSWORD }}
         ORG_GRADLE_PROJECT_openCollabReleasesUsername: ${{ secrets.OPENCOLLAB_USERNAME }}
