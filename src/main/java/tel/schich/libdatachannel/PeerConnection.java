@@ -166,6 +166,20 @@ public class PeerConnection implements Closeable {
     public static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
                                            @Nullable Path certificate, @Nullable Path key,
                                            @Nullable String keyPassword) {
+        return createPeer(config, executor, certificate, key, keyPassword, null);
+    }
+
+    /** Installs a fixed actual-UDP budget before any native ICE work. No diagnostic/player policy. */
+    public static PeerConnection createPeerWithUdpLimits(PeerConnectionConfiguration config, Executor executor,
+                                                         @Nullable DtlsIdentity identity, UdpSendLimits limits) {
+        Objects.requireNonNull(limits, "limits");
+        return createPeer(config, executor, identity == null ? null : identity.certificate(),
+                identity == null ? null : identity.privateKey(), identity == null ? null : identity.password(), limits);
+    }
+
+    private static PeerConnection createPeer(PeerConnectionConfiguration config, Executor executor,
+                                             @Nullable Path certificate, @Nullable Path key,
+                                             @Nullable String keyPassword, @Nullable UdpSendLimits limits) {
         if ((certificate == null) != (key == null)) throw new IllegalArgumentException("Certificate/key must be paired");
         if (keyPassword != null && key == null) throw new IllegalArgumentException("A key password requires an identity");
         String proxyServer = null;
@@ -176,7 +190,7 @@ public class PeerConnection implements Closeable {
         if (config.bindAddress != null) {
             bindAddress = config.bindAddress.getHostAddress();
         }
-        int result = rtcCreatePeerConnectionWithIdentity(
+        int result = limits == null ? rtcCreatePeerConnectionWithIdentity(
                 iceUrisToStrings(config.iceServers),
                 proxyServer,
                 bindAddress,
@@ -191,7 +205,13 @@ public class PeerConnection implements Closeable {
                 config.mtu,
                 config.maxMessageSize,
                 certificate == null ? null : certificate.toString(),
-                key == null ? null : key.toString(), keyPassword);
+                key == null ? null : key.toString(), keyPassword) : LibDataChannelNative.rtcCreatePeerConnectionWithIdentityAndUdpLimits(
+                iceUrisToStrings(config.iceServers), proxyServer, bindAddress, config.certificateType.state,
+                config.iceTransportPolicy.state, config.enableIceTcp, config.enableIceUdpMux,
+                config.disableAutoNegotiation, config.forceMediaTransport, config.portRangeBegin, config.portRangeEnd,
+                config.mtu, config.maxMessageSize, certificate == null ? null : certificate.toString(),
+                key == null ? null : key.toString(), keyPassword, limits.maxDatagrams, limits.maxPayloadBytes,
+                limits.deadlineMonotonicMillis, limits.destinationAddress, limits.destinationPort);
 
         final PeerConnection peer = new PeerConnection(wrapError("rtcCreatePeerConnection", result), executor);
         setupPeerConnectionListener(peer.peerHandle, peer.listener);
@@ -201,6 +221,11 @@ public class PeerConnection implements Closeable {
 
     /** Diagnostic count at native peer construction, including failed attempts. */
     public static long nativeCreationAttempts() { return LibDataChannelNative.rtcGetPeerConnectionCreationAttempts(); }
+
+    public Optional<UdpSendStats> udpSendStats() {
+        long[] values = UdpSendLimits.statsNative(peerHandle);
+        return values == null ? Optional.empty() : Optional.of(UdpSendStats.fromNative(values));
+    }
 
     public static PeerConnection createPeer(PeerConnectionConfiguration config) {
         return createPeer(config, Runnable::run);

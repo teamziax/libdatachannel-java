@@ -5,7 +5,7 @@ git submodule update --init --recursive
 ./gradlew :nativeTransportProbe --no-daemon --max-workers=2 -Plibdatachannel.java-compiler-version=17
 ```
 
-The focused Linux x86_64 build uses JDK 17, CMake, a C/C++ compiler, system OpenSSL
+The focused Linux x86_64 build uses JDK 17, Python 3, CMake, a C/C++ compiler, system OpenSSL
 development files and the `openssl` CLI. Library bytecode remains compatible with
 Java 11. The normal dockcross build remains available for portable artifacts.
 The Java probes reserve loopback UDP ports 49184 and 49195. Native mux tests also
@@ -124,5 +124,63 @@ Construction-attempt diagnostics are package-private test instrumentation and re
 The probe suite additionally covers stalled application executors, same-peer tuple
 attachment, forged attachment, reentrant listener close, scoped C++ preparation and
 asynchronous destruction completion.
+
+## Persistent STUN observations
+
+`IceUdpMuxListener.monitorStun(serverHost, serverPort)` creates an independently owned
+`StunUdpMuxMonitor` on the listener's exact UDP binding. It keeps native STUN refreshes
+running with no player or remote ICE description. Close each monitor explicitly;
+closing the listener leaves an already-created monitor alive, and closing a monitor
+leaves other owners of the shared socket alive. The standalone constructor requires
+the same bind address spelling and fixed port as an existing mux owner.
+
+`binding(index)` copies one resolved server's observation atomically into an immutable
+`StunBinding`. An empty result means that index is unavailable, including while DNS
+is unresolved. Missing success age means no valid response has been observed. Later
+failure retains the historical mapping and its increasing age. Reading a snapshot
+does not renew it: even a retained Java snapshot continues ageing using `nanoTime`.
+The successful-response counter increases for each accepted response; mapping revision
+increases only when the observed address or port changes. Counters restart for a new
+monitor, so applications must track monitor replacement separately. A successful STUN
+observation describes a mapping, not arbitrary-source reachability or successful ICE.
+
+Native DNS resolves once per monitor and does not guarantee both address families in
+its bounded results. Applications needing explicit dual-family coverage should select
+numeric IPv4 and IPv6 server addresses and own one monitor per selection. DNS retry,
+rotation, eligibility, expiry and reachability policy belong to the application. Each
+native refresh runs independently of application polling or control-plane heartbeats.
+The Java age clock, like the native clock on some platforms, can exclude system sleep;
+applications must requalify observations after suspend/resume.
+
+`:nativeStunMonitorProbe` is included in `:nativeTransportProbe`. It runs real JNI and
+native code against local IPv4 and IPv6 UDP responders with the production refresh
+interval. It checks shared socket identity, unchanged and remapped observations,
+owned snapshots and increasing ages, error handling, listener/monitor ownership,
+concurrent reads and close, and absence of peer construction. These local fixtures
+are not evidence of public NAT traversal or gameplay.
+
+`:nativeDiagnosticProbe` is also included in `:nativeTransportProbe`. Its test-owned
+incoming admission connects real ICE, DTLS and SCTP over IPv4 and IPv6 loopback. Two
+named channels negotiate ordered reliable delivery and unordered unreliable delivery
+with zero retransmissions; both ends read back their actual native reliability settings.
+Each end generates a separate random challenge on each channel and verifies its exact
+binary reply. Both local and remote certificate mismatch cases must fail before any
+channel opens. The probe verifies selected local/remote addresses and complete teardown.
+These are native transport feasibility tests. They do not implement a signed provider
+diagnostic principal, public first-contact validation, game session creation or login.
+
+`PeerConnection.selectedCandidatePair()` reads the actual selected native pair. Its
+existing address getters remain available; `localCandidate()` and `remoteCandidate()`
+also expose immutable `IceCandidate` metadata, including candidate type, transport,
+priority and the original SDP/extension tail. Parsing performs no DNS. Address-only
+pairs constructed by callers have no candidate metadata. Native reads size both SDP
+strings dynamically, cap each at 64 KiB including NUL, and retry at most three times
+if the pair grows between sizing and copying. `:nativeCandidatePairBufferProbe` checks
+growth and oversize handling separately from the IPv4/IPv6 live selected-pair checks.
+
+The [isolated diagnostic roles](diagnostic-role.md) extend this fixture to separate
+processes with private test configuration and offer/answer files. They exercise test-owned
+first-contact and assisted known-peer admission on the shared mux; external service
+authorization and native UDP budgets remain separate requirements.
 
 Detailed [contributor and source attribution](../docs/contribution-provenance.md) is retained separately.

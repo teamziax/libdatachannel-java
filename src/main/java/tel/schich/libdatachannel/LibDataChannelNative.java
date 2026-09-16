@@ -5,6 +5,12 @@ import org.eclipse.jdt.annotation.Nullable;
 import java.nio.ByteBuffer;
 
 class LibDataChannelNative {
+    static native int rtcCreatePeerConnectionWithIdentityAndUdpLimits(String @Nullable [] iceServers,
+        @Nullable String proxyServer, @Nullable String bindAddress, int certificateType, int iceTransportPolicy,
+        boolean enableIceTcp, boolean enableIceUdpMux, boolean disableAutoNegotiation, boolean forceMediaTransport,
+        int portRangeBegin, int portRangeEnd, int mtu, int maxMessageSize, @Nullable String certificateFile,
+        @Nullable String keyFile, @Nullable String keyPassword, long maxDatagrams, int maxPayloadBytes,
+        long deadlineMonotonicMillis, @Nullable String destinationAddress, int destinationPort);
     static {
         LibDataChannel.initialize();
     }

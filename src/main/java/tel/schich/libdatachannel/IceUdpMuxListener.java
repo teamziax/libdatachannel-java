@@ -63,6 +63,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
         final Consumer<PeerConnection> initializer;
         final Instant expiresAt;
         final @Nullable PeerConnection existingPeer;
+        final @Nullable UdpSendLimits udpSendLimits;
 
         /** @deprecated Use {@link #builder(String, String)}. */
         @Deprecated
@@ -78,6 +79,14 @@ public final class IceUdpMuxListener implements AutoCloseable {
         public Acceptance(PeerConnectionConfiguration configuration, String remoteDescription, String localPassword,
                           @Nullable Path certificate, @Nullable Path key, @Nullable String keyPassword,
                           Executor peerExecutor, Consumer<PeerConnection> initializer, Instant expiresAt) {
+            this(configuration, remoteDescription, localPassword, certificate, key, keyPassword,
+                    peerExecutor, initializer, expiresAt, null);
+        }
+
+        private Acceptance(PeerConnectionConfiguration configuration, String remoteDescription, String localPassword,
+                          @Nullable Path certificate, @Nullable Path key, @Nullable String keyPassword,
+                          Executor peerExecutor, Consumer<PeerConnection> initializer, Instant expiresAt,
+                          @Nullable UdpSendLimits limits) {
             this.configuration = Objects.requireNonNull(configuration, "configuration");
             this.remoteDescription = Objects.requireNonNull(remoteDescription, "remoteDescription");
             this.localPassword = Objects.requireNonNull(localPassword, "localPassword");
@@ -90,6 +99,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
             this.initializer = Objects.requireNonNull(initializer, "initializer");
             this.expiresAt = Objects.requireNonNull(expiresAt, "expiresAt");
             this.existingPeer = null;
+            this.udpSendLimits = limits;
         }
 
         private Acceptance(PeerConnection peer, Instant expiresAt) {
@@ -101,6 +111,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
             this.initializer = ignored -> {};
             this.expiresAt = Objects.requireNonNull(expiresAt, "expiresAt");
             this.existingPeer = Objects.requireNonNull(peer, "peer");
+            this.udpSendLimits = null; // Reuse retains the already installed native agent budget.
         }
 
         /** Approve another tuple for a caller-owned peer without replacing its identity or channels. */
@@ -118,6 +129,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
             private Executor peerExecutor = Runnable::run;
             private Consumer<PeerConnection> initializer = ignored -> {};
             private Instant expiresAt = Instant.MAX;
+            private @Nullable UdpSendLimits udpSendLimits;
 
             private Builder(String remoteDescription, String localPassword) {
                 this.remoteDescription = Objects.requireNonNull(remoteDescription, "remoteDescription");
@@ -128,10 +140,11 @@ public final class IceUdpMuxListener implements AutoCloseable {
             public Builder peerExecutor(Executor value) { peerExecutor = Objects.requireNonNull(value); return this; }
             public Builder initialize(Consumer<PeerConnection> value) { initializer = Objects.requireNonNull(value); return this; }
             public Builder expiresAt(Instant value) { expiresAt = Objects.requireNonNull(value); return this; }
+            public Builder udpSendLimits(UdpSendLimits value) { udpSendLimits = Objects.requireNonNull(value); return this; }
             public Acceptance build() {
                 return new Acceptance(configuration, remoteDescription, localPassword,
                     identity == null ? null : identity.certificate(), identity == null ? null : identity.privateKey(),
-                    identity == null ? null : identity.password(), peerExecutor, initializer, expiresAt);
+                    identity == null ? null : identity.password(), peerExecutor, initializer, expiresAt, udpSendLimits);
             }
         }
     }
@@ -299,7 +312,7 @@ public final class IceUdpMuxListener implements AutoCloseable {
             int[] prepared = prepareNative(id, request.id, settings.configuration, settings.remoteDescription,
                 request.localUfrag, settings.localPassword,
                 settings.certificate == null ? null : settings.certificate.toString(),
-                settings.key == null ? null : settings.key.toString(), settings.keyPassword);
+                settings.key == null ? null : settings.key.toString(), settings.keyPassword, settings.udpSendLimits);
             preparedHandle = prepared[1];
             if (preparedHandle >= 0) peer = PeerConnection.fromNative(preparedHandle, settings.peerExecutor);
             if (prepared[0] != 0) throw new IllegalStateException("Cannot prepare incoming ICE peer: " + prepared[0]);
@@ -366,6 +379,17 @@ public final class IceUdpMuxListener implements AutoCloseable {
         return new Statistics(statsNative(listenerId));
     }
 
+    /**
+     * Starts caller-owned STUN monitoring on this listener's exact native socket.
+     * No peer or data channel is created. Close the returned monitor separately;
+     * closing this listener leaves its monitor and already accepted peers owned
+     * by their callers.
+     */
+    public synchronized StunUdpMuxMonitor monitorStun(String serverHost, int serverPort) {
+        if (handle == 0) throw new IllegalStateException("ICE listener closed");
+        return StunUdpMuxMonitor.fromListener(listenerId, serverHost, serverPort);
+    }
+
     /** @deprecated Use {@link #statistics()} for named counters. */
     @Deprecated
     public synchronized long[] stats() {
@@ -394,7 +418,16 @@ public final class IceUdpMuxListener implements AutoCloseable {
     private static native void closeNative(long handle);
     private static int[] prepareNative(int handle, long requestId, PeerConnectionConfiguration config,
         String remoteDescription, String localUfrag, String localPassword,
-        @Nullable String certificate, @Nullable String key, @Nullable String keyPassword) {
+        @Nullable String certificate, @Nullable String key, @Nullable String keyPassword, @Nullable UdpSendLimits limits) {
+        if (limits != null) return prepareConfiguredWithUdpLimitsNative(handle, requestId, PeerConnection.iceUrisToStrings(config.iceServers),
+            config.proxyServer == null ? null : config.proxyServer.toASCIIString(),
+            config.bindAddress == null ? null : config.bindAddress.getHostAddress(),
+            config.certificateType.state, config.iceTransportPolicy.state, config.enableIceTcp,
+            config.enableIceUdpMux, config.disableAutoNegotiation, config.forceMediaTransport,
+            config.portRangeBegin, config.portRangeEnd, config.mtu, config.maxMessageSize,
+            certificate, key, keyPassword, remoteDescription, localUfrag, localPassword,
+            limits.maxDatagrams, limits.maxPayloadBytes, limits.deadlineMonotonicMillis,
+            limits.destinationAddress, limits.destinationPort);
         return prepareConfiguredNative(handle, requestId, PeerConnection.iceUrisToStrings(config.iceServers),
             config.proxyServer == null ? null : config.proxyServer.toASCIIString(),
             config.bindAddress == null ? null : config.bindAddress.getHostAddress(),
@@ -409,6 +442,13 @@ public final class IceUdpMuxListener implements AutoCloseable {
         boolean disableAutoNegotiation, boolean forceMediaTransport, int portRangeBegin, int portRangeEnd,
         int mtu, int maxMessageSize, @Nullable String certificate, @Nullable String key, @Nullable String keyPassword,
         String remoteDescription, String localUfrag, String localPassword);
+    private static native int[] prepareConfiguredWithUdpLimitsNative(int handle, long requestId,
+        String @Nullable [] iceServers, @Nullable String proxyServer, @Nullable String bindAddress,
+        int certificateType, int iceTransportPolicy, boolean enableIceTcp, boolean enableIceUdpMux,
+        boolean disableAutoNegotiation, boolean forceMediaTransport, int portRangeBegin, int portRangeEnd,
+        int mtu, int maxMessageSize, @Nullable String certificate, @Nullable String key, @Nullable String keyPassword,
+        String remoteDescription, String localUfrag, String localPassword, long maxDatagrams, int maxPayloadBytes,
+        long deadlineMonotonicMillis, @Nullable String destinationAddress, int destinationPort);
     private static native int acceptNative(int handle, long requestId, int peer);
     private static native int attachNative(int handle, long requestId, int peer);
     private static native int rejectNative(int handle, long requestId);

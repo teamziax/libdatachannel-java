@@ -61,9 +61,16 @@ add_library(datachannel-java SHARED
         src/native_channel.cpp
         src/native_peer.cpp
         src/native_mux.cpp
+        src/native_stun_monitor.cpp
+        src/native_udp_limits.cpp
         src/native_track.cpp
         src/callback.cpp)
 target_link_libraries(datachannel-java PRIVATE datachannel-static)
+if(TRANSPORT_TEARDOWN_TESTS)
+    add_executable(candidate-pair-buffer-test test/candidate_pair_buffer.cpp)
+    target_include_directories(candidate-pair-buffer-test PRIVATE src)
+    target_compile_options(candidate-pair-buffer-test PRIVATE -UNDEBUG)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(datachannel-java PRIVATE -Wl,--no-undefined)
 endif()

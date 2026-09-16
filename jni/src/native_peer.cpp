@@ -1,5 +1,6 @@
 #include "callback.hpp"
 #include "util.hpp"
+#include "candidate_pair_buffer.hpp"
 #include <jni-c-to-java.h>
 #include <jni-java-to-c.h>
 #include <jni.h>
@@ -68,7 +69,7 @@ static jint create_peer(JNIEnv* env, jclass clazz,
                         const jint portRangeBegin, const jint portRangeEnd,
                         const jint mtu, const jint maxMessageSize,
                         jstring certificateFile, jstring keyFile, jstring keyPassword,
-                        incoming_peer* incoming) {
+                        incoming_peer* incoming, const rtcUdpSendLimits* limits = nullptr) {
     // Field by field so that added configuration fields keep compiling.
     rtcConfiguration config = {};
     config.certificateType = static_cast<rtcCertificateType>(certificateType);
@@ -130,10 +131,12 @@ static jint create_peer(JNIEnv* env, jclass clazz,
     jint result = EXCEPTION_THROWN;
     if (!env->ExceptionCheck()) {
         if (incoming != nullptr) {
-            result = rtcPrepareIceUdpMuxPeer(incoming->listener, incoming->request_id, &config, incoming->remote_sdp,
+            result = limits ? rtcPrepareIceUdpMuxPeerWithUdpLimits(incoming->listener, incoming->request_id, &config, limits,
+                                             incoming->remote_sdp, &incoming->local_description, &incoming->pc)
+                            : rtcPrepareIceUdpMuxPeer(incoming->listener, incoming->request_id, &config, incoming->remote_sdp,
                                              &incoming->local_description, &incoming->pc);
         } else {
-            result = static_cast<jint>(rtcCreatePeerConnection(&config));
+            result = limits ? rtcCreatePeerConnectionWithUdpLimits(&config, limits) : rtcCreatePeerConnection(&config);
         }
     }
 
@@ -317,33 +320,18 @@ JNIEXPORT jstring JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rt
 }
 
 JNIEXPORT jobject JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rtcGetSelectedCandidatePair(JNIEnv* env, jclass clazz, const jint peerHandle) {
-    constexpr int bufSize = 50;
-    const auto local = static_cast<char*>(malloc(bufSize));
-    if (local == nullptr) {
-        THROW_FAILED_MALLOC(env, local);
+    try {
+        std::string local, remote;
+        const int result = candidate_pair_buffer::read(peerHandle, local, remote, rtcGetSelectedCandidatePair);
+        if (result < 0) {
+            WRAP_ERROR(env, result);
+            return nullptr;
+        }
+        return call_tel_schich_libdatachannel_CandidatePair_parse_cstr(env, local.c_str(), remote.c_str());
+    } catch (const std::bad_alloc &) {
+        throw_native_exception(env, "Failed to allocate selected candidate pair buffers");
         return nullptr;
     }
-    const auto remote = static_cast<char*>(malloc(bufSize));
-    if (remote == nullptr) {
-        free(local);
-        THROW_FAILED_MALLOC(env, remote);
-        return nullptr;
-    }
-
-    const int result = rtcGetSelectedCandidatePair(peerHandle, local, bufSize, remote, bufSize);
-    if (result < 0) {
-        free(local);
-        free(remote);
-        WRAP_ERROR(env, result);
-        return nullptr;
-    }
-
-    jobject candidatePair = call_tel_schich_libdatachannel_CandidatePair_parse_cstr(env, local, remote);
-
-    free(local);
-    free(remote);
-
-    return candidatePair;
 }
 
 JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_setupPeerConnectionListener(JNIEnv* env, jclass clazz, const jint peerHandle, jobject listener) {
@@ -446,14 +434,14 @@ Java_tel_schich_libdatachannel_LibDataChannelNative_rtcClosePeerConnectionAndWai
     return rtcClosePeerConnectionAndWait(peerHandle, timeoutMs);
 }
 
-extern "C" JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_prepareConfiguredNative(
+static jintArray prepare_configured(
         JNIEnv* env, jclass clazz, const jint listener, const jlong requestId,
         jobjectArray iceServers, jstring proxyServer, jstring bindAddress, const jint certificateType,
         const jint iceTransportPolicy, const jboolean enableIceTcp, const jboolean enableIceUdpMux,
         const jboolean disableAutoNegotiation, const jboolean forceMediaTransport,
         const jint portRangeBegin, const jint portRangeEnd, const jint mtu, const jint maxMessageSize,
         jstring certificateFile, jstring keyFile, jstring keyPassword,
-        jstring remoteDescription, jstring localUfrag, jstring localPassword) {
+        jstring remoteDescription, jstring localUfrag, jstring localPassword, const rtcUdpSendLimits* limits = nullptr) {
     // Allocate the result before creating anything: ownership must never be lost on allocation failure.
     jintArray result = env->NewIntArray(2);
     if (result == nullptr) {
@@ -470,7 +458,7 @@ extern "C" JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxL
     if (!env->ExceptionCheck()) {
         status = create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy,
                              enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin,
-                             portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword, &incoming);
+                             portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword, &incoming, limits);
     }
     if (incoming.remote_sdp != nullptr) {
         env->ReleaseStringUTFChars(remoteDescription, incoming.remote_sdp);
@@ -486,4 +474,67 @@ extern "C" JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxL
         env->SetIntArrayRegion(result, 0, 2, values);
     }
     return result;
+}
+
+// Borrowed JNI string exists only during the synchronous constructor. Native config copies it.
+struct udp_limits_input {
+    JNIEnv* env;
+    jstring address;
+    rtcUdpSendLimits value{};
+    bool valid = false;
+    udp_limits_input(JNIEnv* e, jlong count, jint size, jlong deadline, jstring host, jint port) : env(e), address(host) {
+        if (count < 1 || static_cast<uint64_t>(count) > UINT32_MAX || size < 1 || size > 65507 || deadline < 1 ||
+            port < 0 || port > 65535 || (host != nullptr) != (port != 0) || (host != nullptr && env->GetStringLength(host) > 45)) {
+            throw_native_exception(env, "Invalid UDP send limits"); return;
+        }
+        value.maxDatagrams = static_cast<uint32_t>(count); value.maxPayloadBytes = static_cast<uint32_t>(size);
+        value.deadlineMonotonicMs = static_cast<uint64_t>(deadline); value.destinationPort = static_cast<uint16_t>(port);
+        if (host != nullptr) value.destinationAddress = env->GetStringUTFChars(host, nullptr);
+        valid = !env->ExceptionCheck();
+    }
+    ~udp_limits_input() { if (value.destinationAddress) env->ReleaseStringUTFChars(address, value.destinationAddress); }
+};
+
+extern "C" JNIEXPORT jint JNICALL Java_tel_schich_libdatachannel_LibDataChannelNative_rtcCreatePeerConnectionWithIdentityAndUdpLimits(
+        JNIEnv* env, jclass clazz, jobjectArray iceServers, jstring proxyServer, jstring bindAddress,
+        jint certificateType, jint iceTransportPolicy, jboolean enableIceTcp, jboolean enableIceUdpMux,
+        jboolean disableAutoNegotiation, jboolean forceMediaTransport, jint portRangeBegin, jint portRangeEnd,
+        jint mtu, jint maxMessageSize, jstring certificateFile, jstring keyFile, jstring keyPassword,
+        jlong maxDatagrams, jint maxPayloadBytes, jlong deadline, jstring destination, jint destinationPort) {
+    udp_limits_input limits(env, maxDatagrams, maxPayloadBytes, deadline, destination, destinationPort);
+    if (!limits.valid) return EXCEPTION_THROWN;
+    return create_peer(env, clazz, iceServers, proxyServer, bindAddress, certificateType, iceTransportPolicy,
+                       enableIceTcp, enableIceUdpMux, disableAutoNegotiation, forceMediaTransport, portRangeBegin,
+                       portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile, keyPassword, nullptr, &limits.value);
+}
+
+extern "C" JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_prepareConfiguredNative(
+        JNIEnv* env, jclass clazz, jint listener, jlong requestId,
+        jobjectArray iceServers, jstring proxyServer, jstring bindAddress, jint certificateType,
+        jint iceTransportPolicy, jboolean enableIceTcp, jboolean enableIceUdpMux,
+        jboolean disableAutoNegotiation, jboolean forceMediaTransport,
+        jint portRangeBegin, jint portRangeEnd, jint mtu, jint maxMessageSize,
+        jstring certificateFile, jstring keyFile, jstring keyPassword,
+        jstring remoteDescription, jstring localUfrag, jstring localPassword) {
+    return prepare_configured(env, clazz, listener, requestId, iceServers, proxyServer, bindAddress,
+        certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation,
+        forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile,
+        keyPassword, remoteDescription, localUfrag, localPassword);
+}
+
+extern "C" JNIEXPORT jintArray JNICALL Java_tel_schich_libdatachannel_IceUdpMuxListener_prepareConfiguredWithUdpLimitsNative(
+        JNIEnv* env, jclass clazz, jint listener, jlong requestId,
+        jobjectArray iceServers, jstring proxyServer, jstring bindAddress, jint certificateType,
+        jint iceTransportPolicy, jboolean enableIceTcp, jboolean enableIceUdpMux,
+        jboolean disableAutoNegotiation, jboolean forceMediaTransport,
+        jint portRangeBegin, jint portRangeEnd, jint mtu, jint maxMessageSize,
+        jstring certificateFile, jstring keyFile, jstring keyPassword,
+        jstring remoteDescription, jstring localUfrag, jstring localPassword,
+        jlong maxDatagrams, jint maxPayloadBytes, jlong deadline, jstring destination, jint destinationPort) {
+    udp_limits_input limits(env, maxDatagrams, maxPayloadBytes, deadline, destination, destinationPort);
+    if (!limits.valid) return nullptr;
+    return prepare_configured(env, clazz, listener, requestId, iceServers, proxyServer, bindAddress,
+        certificateType, iceTransportPolicy, enableIceTcp, enableIceUdpMux, disableAutoNegotiation,
+        forceMediaTransport, portRangeBegin, portRangeEnd, mtu, maxMessageSize, certificateFile, keyFile,
+        keyPassword, remoteDescription, localUfrag, localPassword, &limits.value);
 }
